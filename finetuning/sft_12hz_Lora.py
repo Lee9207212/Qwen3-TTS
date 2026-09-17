@@ -24,18 +24,20 @@ import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from dataset import TTSDataset
+from huggingface_hub import snapshot_download
+try:
+    from peft import LoraConfig, PeftModel, get_peft_model
+except ImportError as exc:
+    raise ImportError(
+        "LoRA fine-tuning requires PEFT. Install it with: pip install peft"
+    ) from exc
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
 
 target_speaker_embedding = None
-VAL_IMPROVEMENT_DELTA = 0.01
-LR_SCHEDULER_PATIENCE = 2
-EARLY_STOPPING_PATIENCE = 8
-MIN_LR = 5e-7
 
 
 def parse_args():
@@ -53,6 +55,15 @@ def parse_args():
     parser.add_argument("--max_train_batches", type=int, default=None)
     parser.add_argument("--max_eval_batches", type=int, default=None)
     parser.add_argument("--seed", type=int, default=41)
+    parser.add_argument("--lora_rank", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="q_proj,v_proj",
+        help="Comma-separated Linear module suffixes to adapt with LoRA.",
+    )
     args = parser.parse_args()
 
     if args.dataset_dir:
@@ -70,6 +81,67 @@ def parse_args():
             f"Missing: {', '.join(missing)}"
         )
     return args
+
+
+def apply_lora(model, args, accelerator):
+    """Freeze the base model and add trainable LoRA weights to selected Linear layers."""
+    target_modules = [
+        name.strip()
+        for name in args.lora_target_modules.split(",")
+        if name.strip()
+    ]
+    if not target_modules:
+        raise ValueError("--lora_target_modules must contain at least one module name")
+    if args.lora_rank <= 0 or args.lora_alpha <= 0:
+        raise ValueError("--lora_rank and --lora_alpha must be positive")
+    if not 0.0 <= args.lora_dropout < 1.0:
+        raise ValueError("--lora_dropout must be in [0, 1)")
+
+    available_linear_names = [
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, torch.nn.Linear)
+    ]
+    matched_linear_names = [
+        name
+        for name in available_linear_names
+        if any(name == target or name.endswith(f".{target}") for target in target_modules)
+    ]
+    if not matched_linear_names:
+        preview = ", ".join(available_linear_names[:30])
+        raise ValueError(
+            f"LoRA targets {target_modules} matched no Linear layers. "
+            f"First available Linear layers: {preview}"
+        )
+
+    lora_config = LoraConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=target_modules,
+        bias="none",
+    )
+    model = get_peft_model(model, lora_config)
+
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    trainable_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    if trainable_parameters == 0:
+        raise ValueError("LoRA was applied but no trainable parameters were found")
+
+    accelerator.print(
+        f"LoRA targets: {target_modules} | matched Linear layers: {len(matched_linear_names)}"
+    )
+    for name in matched_linear_names:
+        accelerator.print(f"  LoRA matched: {name}")
+    accelerator.print(
+        f"Trainable parameters: {trainable_parameters:,}/{total_parameters:,} "
+        f"({100.0 * trainable_parameters / total_parameters:.4f}%)"
+    )
+    return model
 
 
 def _ensure_path_exists(value, field_name, path, line_no):
@@ -325,18 +397,22 @@ def write_loss_row(
 def save_final_model(accelerator, model, model_path, output_model_path, speaker_name):
     if not accelerator.is_main_process:
         return
-    if not os.path.isdir(model_path):
-        raise ValueError(
-            "Final model saving expects --init_model_path to be a local directory so required "
-            f"processor/config files can be copied. Got: {model_path}"
+    source_model_path = model_path
+    if not os.path.isdir(source_model_path):
+        accelerator.print(
+            f"Resolving Hugging Face model '{model_path}' from the local cache for final saving."
+        )
+        source_model_path = snapshot_download(
+            repo_id=model_path,
+            local_files_only=True,
         )
     if target_speaker_embedding is None:
         raise ValueError("No target speaker embedding was captured during training")
 
     output_dir = os.path.join(output_model_path, "final_model")
-    shutil.copytree(model_path, output_dir)
+    shutil.copytree(source_model_path, output_dir)
 
-    input_config_file = os.path.join(model_path, "config.json")
+    input_config_file = os.path.join(source_model_path, "config.json")
     output_config_file = os.path.join(output_dir, "config.json")
     with open(input_config_file, 'r', encoding='utf-8') as f:
         config_dict = json.load(f)
@@ -354,6 +430,10 @@ def save_final_model(accelerator, model, model_path, output_model_path, speaker_
         json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
     unwrapped_model = accelerator.unwrap_model(model)
+    if isinstance(unwrapped_model, PeftModel):
+        # Restore the original Qwen3-TTS parameter names so the existing
+        # Qwen3TTSModel.from_pretrained inference path can load this checkpoint.
+        unwrapped_model = unwrapped_model.merge_and_unload()
     state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
 
     drop_prefix = "speaker_encoder"
@@ -388,6 +468,7 @@ def train():
         torch_dtype=torch.bfloat16,
         attn_implementation="sdpa",
     )
+    qwen3tts.model = apply_lora(qwen3tts.model, args, accelerator)
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
     train_data = load_jsonl(args.train_jsonl, "train")
@@ -397,29 +478,22 @@ def train():
     val_dataloader = build_dataloader(val_data, qwen3tts.processor, config, args.batch_size, shuffle=False)
     test_dataloader = build_dataloader(test_data, qwen3tts.processor, config, args.batch_size, shuffle=False)
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+    trainable_parameters = [
+        parameter
+        for parameter in qwen3tts.model.parameters()
+        if parameter.requires_grad
+    ]
+    optimizer = AdamW(trainable_parameters, lr=args.lr, weight_decay=0.01)
 
     model, optimizer, train_dataloader, val_dataloader, test_dataloader = accelerator.prepare(
         qwen3tts.model, optimizer, train_dataloader, val_dataloader, test_dataloader
     )
-    scheduler = ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=LR_SCHEDULER_PATIENCE,
-        threshold=VAL_IMPROVEMENT_DELTA,
-        threshold_mode="abs",
-        min_lr=MIN_LR,
-    )
-
     num_epochs = args.num_epochs
     model.train()
     global_step = 0
     best_val_loss = None
     best_epoch = 0
     best_model_state = None
-    early_stopping_best = None
-    early_stopping_bad_epochs = 0
     completed_epochs = 0
 
     csv_file = None
@@ -506,13 +580,6 @@ def train():
             best_epoch = epoch + 1
             best_model_state = clone_model_state(model, accelerator)
 
-        if early_stopping_best is None or val_loss < early_stopping_best - VAL_IMPROVEMENT_DELTA:
-            early_stopping_best = val_loss
-            early_stopping_bad_epochs = 0
-        else:
-            early_stopping_bad_epochs += 1
-
-        scheduler.step(val_loss)
         lr = current_lr(optimizer)
         completed_epochs = epoch + 1
 
@@ -541,13 +608,6 @@ def train():
                 epoch_gradient_norm,
                 epoch_has_nan_or_inf,
             )
-
-        if early_stopping_bad_epochs >= EARLY_STOPPING_PATIENCE:
-            accelerator.print(
-                f"Early stopping at epoch {epoch + 1}: validation loss did not improve by "
-                f"at least {VAL_IMPROVEMENT_DELTA:.2f} for {EARLY_STOPPING_PATIENCE} consecutive epochs."
-            )
-            break
 
     if best_model_state is None:
         raise ValueError("No validation result was recorded; cannot restore best model for final test")

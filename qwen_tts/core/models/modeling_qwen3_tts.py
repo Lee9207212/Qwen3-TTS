@@ -1239,7 +1239,13 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss = self.loss_function(
+                logits=logits,
+                labels=None,
+                shift_labels=labels.contiguous(),
+                vocab_size=self.config.vocab_size,
+                **kwargs,
+            )
 
         return Qwen3TTSTalkerCodePredictorOutputWithPast(
             loss=loss,
@@ -1839,7 +1845,32 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         self.tts_model_type = self.config.tts_model_type
 
         self.post_init()
-    
+
+    @staticmethod
+    def _casefold_mapping_lookup(mapping, name, label):
+        folded = {}
+        mapping = mapping or {}
+        for original_key, value in mapping.items():
+            folded_key = str(original_key).casefold()
+            if folded_key in folded:
+                existing_key, existing_value = folded[folded_key]
+                if existing_value != value:
+                    raise ValueError(
+                        f"{label} collision after casefold: "
+                        f"{existing_key!r}->{existing_value!r}, "
+                        f"{original_key!r}->{value!r}"
+                    )
+                continue
+            folded[folded_key] = (original_key, value)
+
+        lookup_key = str(name).casefold()
+        if lookup_key not in folded:
+            available = sorted(str(key) for key in mapping.keys())
+            raise NotImplementedError(
+                f"{label} {name} not implemented. Supported: {available}"
+            )
+        return folded[lookup_key]
+
     def load_speech_tokenizer(self, speech_tokenizer):
         self.speech_tokenizer = speech_tokenizer
     
@@ -2088,11 +2119,12 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 if speaker == "" or speaker == None: # Instruct create speaker
                     speaker_embed = None
                 else:
-                    if speaker.lower() not in self.config.talker_config.spk_id:
-                        raise NotImplementedError(f"Speaker {speaker} not implemented")
-                    else:
-                        spk_id = self.config.talker_config.spk_id[speaker.lower()]
-                        speaker_embed = self.talker.get_input_embeddings()(
+                    _, spk_id = self._casefold_mapping_lookup(
+                        self.config.talker_config.spk_id,
+                        speaker,
+                        "Speaker",
+                    )
+                    speaker_embed = self.talker.get_input_embeddings()(
                                             torch.tensor(
                                                 spk_id,
                                                 device=self.talker.device,
@@ -2115,11 +2147,14 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 else:
                     language_id = self.config.talker_config.codec_language_id[language.lower()]
             
-            if (language.lower() in ["chinese", "auto"] and \
-                   speaker != "" and speaker is not None and \
-                     self.config.talker_config.spk_is_dialect[speaker.lower()] != False):
-                dialect = self.config.talker_config.spk_is_dialect[speaker.lower()]
-                language_id = self.config.talker_config.codec_language_id[dialect]
+            if language.lower() in ["chinese", "auto"] and speaker != "" and speaker is not None:
+                _, dialect = self._casefold_mapping_lookup(
+                    self.config.talker_config.spk_is_dialect,
+                    speaker,
+                    "Speaker dialect",
+                )
+                if dialect != False:
+                    language_id = self.config.talker_config.codec_language_id[dialect]
             
             tts_bos_embed, tts_eos_embed, tts_pad_embed = self.talker.text_projection(
                 self.talker.get_text_embeddings()(

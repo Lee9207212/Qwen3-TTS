@@ -135,7 +135,16 @@ class Qwen3TTSModel:
             v = spks()
             if v is None:
                 return None
-            return set([str(x).lower() for x in v])
+            return set([str(x).casefold() for x in v])
+        return None
+
+    def _supported_speakers_list(self) -> Optional[List[str]]:
+        spks = getattr(self.model, "get_supported_speakers", None)
+        if callable(spks):
+            v = spks()
+            if v is None:
+                return None
+            return [str(x) for x in v]
         return None
 
     def _validate_languages(self, languages: List[str]) -> None:
@@ -180,10 +189,11 @@ class Qwen3TTSModel:
         for spk in speakers:
             if spk is None or spk == "":
                 continue
-            if str(spk).lower() not in supported:
+            if str(spk).casefold() not in supported:
                 bad.append(spk)
         if bad:
-            raise ValueError(f"Unsupported speakers: {bad}. Supported: {sorted(supported)}")
+            available = self._supported_speakers_list()
+            raise ValueError(f"Unsupported speakers: {bad}. Supported: {sorted(available or [])}")
 
     def _is_probably_base64(self, s: str) -> bool:
         if s.startswith("data:audio"):
