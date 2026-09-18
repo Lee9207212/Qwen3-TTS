@@ -30,6 +30,27 @@ def resolve_config_path(model_path):
     local = os.path.join(model_path, "config.json")
     if os.path.isfile(local):
         return local
+
+    if os.path.isdir(model_path):
+        # Some local checkouts nest the real files (e.g. HF cache snapshots).
+        candidates = sorted(
+            os.path.join(root, "config.json")
+            for root, _dirs, files in os.walk(model_path)
+            if "config.json" in files
+        )
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            print("Found several config.json files; pass the exact directory:")
+            for candidate in candidates:
+                print(f"  {candidate}")
+            raise SystemExit(1)
+        print(f"No config.json anywhere under {model_path}")
+        print("Top-level contents:")
+        for entry in sorted(os.listdir(model_path))[:40]:
+            print(f"  {entry}")
+        raise SystemExit(1)
+
     from huggingface_hub import snapshot_download
 
     resolved = snapshot_download(repo_id=model_path, local_files_only=True)
