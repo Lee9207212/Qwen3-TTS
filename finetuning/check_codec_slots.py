@@ -2,14 +2,20 @@
 """Check whether the codec_embedding rows used to store speaker/emotion
 embeddings collide with codec tokens the talker can actually generate.
 
+Reads the codec embedding shape from config.json when available, and falls
+back to the safetensors header (no weights are loaded either way).
+
 Usage:
-    python3 finetuning/check_codec_slots.py --model_path Qwen/Qwen3-TTS-12Hz-0.6B-Base
-    python3 finetuning/check_codec_slots.py --model_path <path> --data_jsonl <prepared>.jsonl
+    python3 finetuning/check_codec_slots.py --model_path <model dir>
+    python3 finetuning/check_codec_slots.py --model_path <model dir> --data_jsonl <prepared>.jsonl
 """
 import argparse
 import json
 import os
+import struct
 from collections import Counter
+
+CODEC_EMBEDDING_KEY = "talker.model.codec_embedding.weight"
 
 
 def parse_args():
@@ -26,71 +32,85 @@ def parse_args():
     return parser.parse_args()
 
 
-def resolve_config_path(model_path):
-    local = os.path.join(model_path, "config.json")
-    if os.path.isfile(local):
-        return local
+def find_file(model_path, filename):
+    """Locate `filename` at the top level of model_path, else anywhere beneath it."""
+    direct = os.path.join(model_path, filename)
+    if os.path.isfile(direct):
+        return direct
+    if not os.path.isdir(model_path):
+        return None
+    for root, _dirs, files in os.walk(model_path):
+        if filename in files:
+            return os.path.join(root, filename)
+    return None
 
-    if os.path.isdir(model_path):
-        # Some local checkouts nest the real files (e.g. HF cache snapshots).
-        candidates = sorted(
-            os.path.join(root, "config.json")
-            for root, _dirs, files in os.walk(model_path)
-            if "config.json" in files
-        )
-        if len(candidates) == 1:
-            return candidates[0]
-        if len(candidates) > 1:
-            print("Found several config.json files; pass the exact directory:")
-            for candidate in candidates:
-                print(f"  {candidate}")
-            raise SystemExit(1)
-        print(f"No config.json anywhere under {model_path}")
+
+def read_safetensors_header(path):
+    """Return the safetensors JSON header without reading any tensor data."""
+    with open(path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        return json.loads(f.read(header_len).decode("utf-8"))
+
+
+def codec_embedding_shape(model_path):
+    """(rows, dim) of the codec embedding, from config.json or the weight file."""
+    config_path = find_file(model_path, "config.json")
+    if config_path:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config_dict = json.load(f)
+        talker = config_dict["talker_config"]
+        print(f"source: {config_path}")
+        return talker["vocab_size"], talker["hidden_size"], talker
+
+    weights_path = find_file(model_path, "model.safetensors")
+    if weights_path is None:
+        print(f"Neither config.json nor model.safetensors found under {model_path}")
         print("Top-level contents:")
         for entry in sorted(os.listdir(model_path))[:40]:
             print(f"  {entry}")
         raise SystemExit(1)
 
-    from huggingface_hub import snapshot_download
+    header = read_safetensors_header(weights_path)
+    if CODEC_EMBEDDING_KEY not in header:
+        matches = [k for k in header if "codec_embedding" in k]
+        print(f"'{CODEC_EMBEDDING_KEY}' not in {weights_path}")
+        print("Keys containing 'codec_embedding':")
+        for key in matches[:20] or ["(none)"]:
+            print(f"  {key}")
+        raise SystemExit(1)
 
-    resolved = snapshot_download(repo_id=model_path, local_files_only=True)
-    return os.path.join(resolved, "config.json")
+    rows, dim = header[CODEC_EMBEDDING_KEY]["shape"]
+    print(f"source: {weights_path} (no config.json; shape read from the weight header)")
+    return rows, dim, None
 
 
-def report_config(config_dict, start_id, num_slots):
-    talker = config_dict["talker_config"]
-    vocab_size = talker["vocab_size"]
-    hidden_size = talker["hidden_size"]
-    eos = talker["codec_eos_token_id"]
-
+def report(rows, dim, talker, start_id, num_slots):
     # Mirrors the suppress_tokens rule in Qwen3TTSForConditionalGeneration.generate
-    suppress_start = vocab_size - 1024
+    suppress_start = rows - 1024
     slots = list(range(start_id, start_id + num_slots))
 
-    print("=" * 60)
-    print("config.json")
-    print("=" * 60)
-    print(f"codec_embedding rows (talker vocab_size) : {vocab_size}")
-    print(f"embedding dim        (talker hidden_size): {hidden_size}")
-    print(f"special codec ids                        : "
-          f"pad={talker['codec_pad_id']} bos={talker['codec_bos_id']} eos={eos} "
-          f"think={talker['codec_think_id']} nothink={talker['codec_nothink_id']}")
-    print(f"suppressed id range at generation         : [{suppress_start}, {vocab_size})")
-    print(f"generatable id range                      : [0, {suppress_start}) plus eos={eos}")
     print()
-    print("=" * 60)
+    print("=" * 62)
+    print(f"codec_embedding rows : {rows}")
+    print(f"embedding dim        : {dim}")
+    if talker is not None:
+        print(
+            f"special codec ids    : pad={talker['codec_pad_id']} bos={talker['codec_bos_id']} "
+            f"eos={talker['codec_eos_token_id']}"
+        )
+    print(f"suppressed at generation : [{suppress_start}, {rows})")
+    print(f"generatable              : [0, {suppress_start})")
+    print("=" * 62)
     print(f"slots to overwrite: {slots}")
-    print("=" * 60)
-
     unsafe = [i for i in slots if i < suppress_start]
-    if not unsafe:
-        print("SAFE - none of these ids can be generated; overwriting them is harmless.")
-    else:
+    if unsafe:
         print(f"COLLISION - these ids ARE generatable: {unsafe}")
-        print("Overwriting them means a generated token of that id feeds the")
-        print("speaker/emotion vector back in as its own input embedding.")
-    print(f"free rows past the generatable range: [{suppress_start}, {vocab_size})")
-    return suppress_start, slots
+        print("A generated token with that id would read the speaker/emotion")
+        print("vector as its own input embedding.")
+    else:
+        print("SAFE - none of these ids can be generated.")
+    print(f"rows past the generatable range: [{suppress_start}, {rows})")
+    return slots
 
 
 def report_usage(data_jsonl, slots):
@@ -114,26 +134,21 @@ def report_usage(data_jsonl, slots):
                     counter[row[0]] += 1
 
     print()
-    print("=" * 60)
+    print("=" * 62)
     print(f"actual usage in {data_jsonl}")
-    print("=" * 60)
+    print("=" * 62)
     print(f"utterances: {lines}   codec_0 frames: {total}")
-    hits = sum(counter.values())
     for slot in slots:
         print(f"  id {slot}: {counter.get(slot, 0)} frames")
+    hits = sum(counter.values())
     ratio = (hits / total * 100) if total else 0.0
     print(f"total hits: {hits} / {total} frames ({ratio:.4f}%)")
 
 
 def main():
     args = parse_args()
-    config_path = resolve_config_path(args.model_path)
-    print(f"reading {config_path}\n")
-    with open(config_path, "r", encoding="utf-8") as f:
-        config_dict = json.load(f)
-
-    _suppress_start, slots = report_config(config_dict, args.start_id, args.num_slots)
-
+    rows, dim, talker = codec_embedding_shape(args.model_path)
+    slots = report(rows, dim, talker, args.start_id, args.num_slots)
     if args.data_jsonl:
         report_usage(args.data_jsonl, slots)
 
