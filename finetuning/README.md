@@ -85,6 +85,99 @@ wavs, sr = tts.generate_custom_voice(
 sf.write("output.wav", wavs[0], sr)
 ```
 
+### Emotion-conditioned LoRA fine-tuning (`sft_12hz_Lora.py`)
+
+`sft_12hz_Lora.py` trains one speaker with a per-emotion offset, so a single
+checkpoint can speak the same voice in several emotions. It does not touch the
+inference code: each emotion is registered as its own speaker name.
+
+**How it works.** Position 6 of the prompt is the model's only conditioning
+vector. Speaker-only fine-tuning writes the frozen speaker-encoder output there;
+this script writes `speaker + emotion[i]` instead, where the emotion table is a
+zero-initialised `len(EMOTIONS) x hidden_size` tensor trained alongside the LoRA
+adapters. Because an emotion row only participates in the forward pass of its own
+samples, every other row receives zero gradient — each row is shaped solely by
+its own data.
+
+Generation performs a single embedding lookup and has no notion of addition, so
+the sums are precomputed at save time and stored in `codec_embedding` rows
+`3000 .. 3000 + len(EMOTIONS) - 1`. For `Qwen3-TTS-12Hz-0.6B-Base` that table has
+3072 rows, sampling is restricted to ids below 2048, and the special codec ids
+end at 2157, so this range is unreachable by the talker. Verify it for any other
+checkpoint before training:
+
+```bash
+python check_codec_slots.py --model_path Qwen/Qwen3-TTS-12Hz-0.6B-Base
+```
+
+**Extra JSONL field.** Every line needs an `emotion` field matching one of the
+names in `EMOTIONS` (see `dataset.py`):
+
+```jsonl
+{"audio":"./data/utt0001.wav","text":"...","ref_audio":"./data/ref.wav","emotion":"anger"}
+```
+
+Keep `ref_audio` identical across the whole dataset. If the reference audio
+varies with emotion, the speaker encoder already encodes the emotion and the
+table has nothing left to learn — the rows end up near-identical.
+
+**Training.** The emotion table lives outside the PEFT wrapper (anything added
+after `get_peft_model()` is frozen by PEFT or dropped by `merge_and_unload()`),
+so it gets its own optimizer group. It is tiny and zero-initialised, and needs a
+much larger learning rate than the adapters:
+
+```bash
+python sft_12hz_Lora.py \
+  --init_model_path Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  --output_model_path output \
+  --dataset_dir ./dataset \
+  --speaker_name F2 \
+  --lr 2e-5 \
+  --emotion_lr 1e-3 \
+  --num_epochs 3
+```
+
+Split the data so every emotion appears in each split; training aborts if an
+emotion is missing from the training split and warns if it is missing from
+validation.
+
+**Per-emotion validation.** Support is usually uneven, so an emotion that never
+fitted can hide behind the others in a single averaged number. Each epoch the
+script also evaluates one emotion at a time and prints a row per emotion plus
+the best and worst, and appends the same figures to
+`output/emotion_loss_history.csv` in long format (one row per split/emotion).
+This is a second sweep of the validation set, not six, because the rows are
+partitioned; `--emotion_eval_every N` reports every N epochs and `0` turns it
+off. `loss_history.csv` and the early-stopping decision are unaffected -- they
+still use the aggregate pass.
+
+**Speaker vector constancy.** `save_final_model` bakes the *first* sample of the
+*first* batch as the speaker vector for every exported row, which is only
+meaningful while `ref_audio` is one fixed file. The script measures the relative
+spread between the speaker vectors -- within a batch and against the first batch
+-- warns as soon as it exceeds 5%, and prints the verdict at save time. The
+tolerance is there to absorb bf16 rounding; a genuinely different reference
+shows up at O(100%). If it warns, the saved voice is an arbitrary pick among the
+references seen.
+
+**Checking that it learned anything.** The first training step is numerically
+identical to speaker-only fine-tuning, since the table starts at zero. At save
+time the script prints each emotion vector's norm (next to the speaker vector's,
+as a scale reference) and their pairwise cosine similarity. Similarities near
+1.0 across the board mean the table did not differentiate — check the
+`ref_audio` and `--emotion_lr` first. The raw table is also written to
+`output/emotion_table.pt`.
+
+**Inference.** Speaker names are `<speaker_name>_<emotion>`:
+
+```python
+wavs, sr = tts.generate_custom_voice(
+    text="...",
+    speaker="F2_anger",
+)
+```
+
+
 ### One-click shell script example
 
 ```bash

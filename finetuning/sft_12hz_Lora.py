@@ -15,15 +15,17 @@
 # limitations under the License.
 import argparse
 import csv
+import itertools
 import json
 import random
 import os
 import shutil
+from collections import Counter
 
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from dataset import TTSDataset
+from dataset import EMOTION_TO_ID, EMOTIONS, TTSDataset
 from huggingface_hub import snapshot_download
 try:
     from peft import LoraConfig, PeftModel, get_peft_model
@@ -39,6 +41,68 @@ from transformers import AutoConfig
 
 target_speaker_embedding = None
 
+# First codec_embedding row used to store a "speaker + emotion" vector. Rows
+# [SPEAKER_SLOT_START, SPEAKER_SLOT_START + len(EMOTIONS)) are overwritten at
+# save time, so they must not alias anything the talker can emit or look up.
+# Verified for Qwen3-TTS-12Hz-0.6B-Base: the table has 3072 rows, generation is
+# restricted to ids below 2048, the special codec ids span 2148-2157 and the
+# highest codec_language_id is 2071. Nothing reaches 3000. Re-check with
+# check_codec_slots.py before using a different checkpoint.
+SPEAKER_SLOT_START = 3000
+
+# save_final_model() bakes one speaker vector into every exported row, taken
+# from the first sample of the first batch. That is only meaningful while
+# ref_audio resolves to a single fixed file for every row. Nothing downstream
+# would notice if that stopped holding, so measure the spread instead of
+# assuming it. Relative, so the figure is comparable across checkpoints; its
+# floor is bf16 rounding, not a real difference in voice.
+SPEAKER_DRIFT_TOLERANCE = 0.05
+speaker_drift_in_batch = 0.0
+speaker_drift_across_batches = 0.0
+_speaker_drift_warned = False
+
+
+def track_speaker_drift(speaker_embedding, reference):
+    """Record how far apart the per-sample speaker vectors sit."""
+    global speaker_drift_in_batch, speaker_drift_across_batches, _speaker_drift_warned
+
+    vectors = speaker_embedding.detach().float()
+    scale = vectors.abs().max().clamp(min=1e-6)
+    in_batch = ((vectors - vectors[0:1]).abs().max() / scale).item()
+    speaker_drift_in_batch = max(speaker_drift_in_batch, in_batch)
+
+    across = 0.0
+    if reference is not None:
+        first = reference.detach().float().to(vectors.device)[0:1]
+        across = ((vectors - first).abs().max() / scale).item()
+        speaker_drift_across_batches = max(speaker_drift_across_batches, across)
+
+    if not _speaker_drift_warned and max(in_batch, across) > SPEAKER_DRIFT_TOLERANCE:
+        _speaker_drift_warned = True
+        print(
+            f"WARNING: speaker vectors are not constant (within batch {in_batch:.4f}, "
+            f"against the first batch {across:.4f}, tolerance "
+            f"{SPEAKER_DRIFT_TOLERANCE}). Every exported row reuses the first "
+            "sample's vector, so the saved voice would be an arbitrary pick. "
+            "Point every row at one fixed ref_audio."
+        )
+
+
+def report_speaker_drift(accelerator):
+    """Say whether baking a single speaker vector was a safe choice."""
+    accelerator.print(
+        f"Speaker vector spread (relative): within a batch {speaker_drift_in_batch:.5f}, "
+        f"against the first batch {speaker_drift_across_batches:.5f}, "
+        f"tolerance {SPEAKER_DRIFT_TOLERANCE}"
+    )
+    if max(speaker_drift_in_batch, speaker_drift_across_batches) > SPEAKER_DRIFT_TOLERANCE:
+        accelerator.print(
+            "  WARNING: ref_audio did not produce one constant speaker vector; "
+            "the baked voice is an arbitrary pick among those seen."
+        )
+    else:
+        accelerator.print("  OK: one constant speaker vector, safe to bake.")
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -50,10 +114,30 @@ def parse_args():
     parser.add_argument("--test_jsonl", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument(
+        "--emotion_lr",
+        type=float,
+        default=1e-3,
+        help=(
+            "Learning rate for the emotion table. It is a zero-initialised "
+            f"{len(EMOTIONS)}x hidden_size tensor and needs a much larger step "
+            "size than the LoRA adapters to move at all."
+        ),
+    )
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     parser.add_argument("--max_train_batches", type=int, default=None)
     parser.add_argument("--max_eval_batches", type=int, default=None)
+    parser.add_argument(
+        "--emotion_eval_every",
+        type=int,
+        default=1,
+        help=(
+            "Report the per-emotion validation breakdown every N epochs; 0 turns "
+            "it off. The breakdown covers the same rows as the aggregate pass, so "
+            "it costs one extra sweep of the validation set."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
@@ -144,6 +228,84 @@ def apply_lora(model, args, accelerator):
     return model
 
 
+def build_emotion_table(hidden_size, accelerator):
+    """A small zero-initialised lookup table, one row per emotion.
+
+    It is deliberately kept outside the PEFT-wrapped model: anything attached
+    after get_peft_model() is either frozen by PEFT or dropped by
+    merge_and_unload(). Keeping it separate means we own its gradients, its
+    optimizer group and its checkpointing.
+
+    Zero initialisation makes the first training step numerically identical to
+    speaker-only fine-tuning, which is a free sanity check.
+    """
+    table = torch.nn.Embedding(len(EMOTIONS), hidden_size)
+    torch.nn.init.zeros_(table.weight)
+    # Kept in fp32: bf16 cannot accumulate the small updates this table needs.
+    table = table.float()
+    accelerator.print(
+        f"Emotion table: {len(EMOTIONS)} x {hidden_size} "
+        f"({table.weight.numel():,} parameters), rows = {EMOTIONS}"
+    )
+    return table
+
+
+def report_emotion_counts(splits, accelerator):
+    """Print the per-split emotion histogram and fail fast on empty rows."""
+    accelerator.print("Emotion distribution:")
+    header = f"  {'split':<8}" + "".join(f"{name[:8]:>10}" for name in EMOTIONS) + f"{'total':>8}"
+    accelerator.print(header)
+    for split_name, rows in splits.items():
+        counts = Counter(row["emotion"] for row in rows)
+        line = "".join(f"{counts.get(name, 0):>10}" for name in EMOTIONS)
+        accelerator.print(f"  {split_name:<8}{line}{len(rows):>8}")
+
+    missing = [name for name in EMOTIONS if not any(
+        row["emotion"] == name for row in splits["train"]
+    )]
+    if missing:
+        raise ValueError(
+            f"No training samples for {missing}; those emotion rows would never "
+            "receive a gradient and would stay at their zero initialisation"
+        )
+    thin = [name for name in EMOTIONS if not any(
+        row["emotion"] == name for row in splits["val"]
+    )]
+    if thin:
+        accelerator.print(
+            f"Validation split has no samples for {thin}; the validation loss "
+            "will not reflect those emotions. Consider a stratified split."
+        )
+
+
+def report_emotion_table(weight, accelerator, speaker_embedding=None):
+    """Print pairwise cosine similarity so we can tell whether anything was learned."""
+    weight = weight.detach().float()
+    norms = weight.norm(dim=-1)
+    accelerator.print("Emotion vector norms:")
+    for name, norm in zip(EMOTIONS, norms.tolist()):
+        accelerator.print(f"  {name:<9} {norm:.6f}")
+    if speaker_embedding is not None:
+        speaker_norm = speaker_embedding.detach().float().norm().item()
+        accelerator.print(f"  speaker   {speaker_norm:.6f} (reference scale)")
+
+    if norms.min().item() < 1e-8:
+        accelerator.print(
+            "At least one emotion vector is still all zeros - it never received "
+            "a gradient. Check that every emotion appears in the training split."
+        )
+        return
+
+    similarity = torch.nn.functional.normalize(weight, dim=-1)
+    similarity = similarity @ similarity.T
+    accelerator.print("Pairwise cosine similarity (want these well below 1.0):")
+    header = " " * 11 + "".join(f"{name[:7]:>9}" for name in EMOTIONS)
+    accelerator.print(header)
+    for i, name in enumerate(EMOTIONS):
+        row = "".join(f"{similarity[i, j].item():>9.3f}" for j in range(len(EMOTIONS)))
+        accelerator.print(f"  {name:<9}{row}")
+
+
 def _ensure_path_exists(value, field_name, path, line_no):
     values = value if isinstance(value, list) else [value]
     for item in values:
@@ -159,7 +321,7 @@ def load_jsonl(path, split_name):
     if os.path.getsize(path) == 0:
         raise ValueError(f"{split_name} JSONL is empty: {path}")
 
-    required_fields = {"audio", "text", "ref_audio", "audio_codes"}
+    required_fields = {"audio", "text", "ref_audio", "audio_codes", "emotion"}
     rows = []
     with open(path, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, 1):
@@ -175,6 +337,11 @@ def load_jsonl(path, split_name):
                 raise ValueError(f"{path}:{line_no} missing fields: {sorted(missing)}")
             if not isinstance(item["text"], str):
                 raise ValueError(f"{path}:{line_no} field 'text' must be a string")
+            if item["emotion"] not in EMOTION_TO_ID:
+                raise ValueError(
+                    f"{path}:{line_no} field 'emotion' is {item['emotion']!r}; "
+                    f"expected one of {EMOTIONS}"
+                )
             _ensure_path_exists(item["audio"], "audio", path, line_no)
             _ensure_path_exists(item["ref_audio"], "ref_audio", path, line_no)
 
@@ -204,17 +371,23 @@ def build_dataloader(data, processor, config, batch_size, shuffle):
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=dataset.collate_fn)
 
 
-def compute_loss(model, batch):
+def compute_loss(model, batch, emotion_table):
     input_ids = batch['input_ids']
     codec_ids = batch['codec_ids']
     ref_mels = batch['ref_mels']
+    emotion_ids = batch['emotion_ids']
     text_embedding_mask = batch['text_embedding_mask']
     codec_embedding_mask = batch['codec_embedding_mask']
     attention_mask = batch['attention_mask']
     codec_0_labels = batch['codec_0_labels']
     codec_mask = batch['codec_mask']
 
+    # Detached on purpose: the speaker encoder stays frozen, so with a fixed
+    # ref_audio this vector is a constant for the whole run.
     speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
+    track_speaker_drift(speaker_embedding, target_speaker_embedding)
+    # NOT detached: this is the only path by which the emotion table learns.
+    emotion_embedding = emotion_table(emotion_ids.to(model.device))
 
     input_text_ids = input_ids[:, :, 0]
     input_codec_ids = input_ids[:, :, 1]
@@ -223,7 +396,9 @@ def compute_loss(model, batch):
         model.talker.model.text_embedding(input_text_ids)
     ) * text_embedding_mask
     input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-    input_codec_embedding[:, 6, :] = speaker_embedding
+    # Slot 6 is masked to zero by the collate function and is the model's only
+    # conditioning vector; speaker identity and emotion share it additively.
+    input_codec_embedding[:, 6, :] = speaker_embedding + emotion_embedding.to(speaker_embedding.dtype)
 
     input_embeddings = input_text_embedding + input_codec_embedding
 
@@ -307,16 +482,116 @@ def finalize_loss(total_stats):
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, accelerator, max_batches=None):
+def evaluate(model, dataloader, accelerator, emotion_table, max_batches=None):
     model.eval()
+    emotion_table.eval()
     total_stats = _empty_loss_stats()
     for step, batch in enumerate(dataloader):
         if max_batches is not None and step >= max_batches:
             break
-        _loss, batch_stats, _speaker_embedding = compute_loss(model, batch)
+        _loss, batch_stats, _speaker_embedding = compute_loss(model, batch, emotion_table)
         add_loss_stats(total_stats, batch_stats, accelerator)
     model.train()
+    emotion_table.train()
     return finalize_loss(total_stats)
+
+
+def build_emotion_dataloaders(splits, processor, config, batch_size, accelerator):
+    """One eval dataloader per (split, emotion), built and prepared once.
+
+    `accelerator.prepare` keeps a reference to every dataloader handed to it, so
+    building these per epoch would pile up. Emotions absent from a split are
+    skipped rather than producing an empty loader.
+    """
+    keys = []
+    loaders = []
+    for split_name, rows in splits.items():
+        for emotion in EMOTIONS:
+            subset = [row for row in rows if row["emotion"] == emotion]
+            if not subset:
+                continue
+            keys.append((split_name, emotion))
+            loaders.append(
+                build_dataloader(subset, processor, config, batch_size, shuffle=False)
+            )
+    if not loaders:
+        return {}
+    prepared = accelerator.prepare(*loaders)
+    if len(loaders) == 1:
+        prepared = (prepared,)
+    return dict(zip(keys, prepared))
+
+
+@torch.no_grad()
+def evaluate_by_emotion(model, emotion_loaders, split, accelerator, emotion_table, max_batches=None):
+    """Per-emotion losses for one split.
+
+    Each emotion gets its own homogeneous pass so `evaluate` is reused
+    unchanged and the numbers stay comparable with the aggregate figure.
+    Splitting the batched mean per token would not be comparable, because a
+    batch mixes emotions and the mean is already reduced.
+    """
+    results = {}
+    for emotion in EMOTIONS:
+        loader = emotion_loaders.get((split, emotion))
+        results[emotion] = (
+            evaluate(model, loader, accelerator, emotion_table, max_batches)
+            if loader is not None
+            else None
+        )
+    return results
+
+
+def report_emotion_losses(results, accelerator, title):
+    """Print one loss row per emotion, then name the best and the worst.
+
+    Support is uneven - fear has the fewest training rows and surprise the most
+    - so an emotion that never fitted can hide behind the others in a single
+    averaged number.
+    """
+    accelerator.print(f"{title} by emotion:")
+    accelerator.print(f"  {'emotion':<10}{'main':>11}{'sub':>11}{'total':>11}")
+    ranked = []
+    for emotion in EMOTIONS:
+        losses = results.get(emotion)
+        if losses is None:
+            accelerator.print(f"  {emotion:<10}{'(no rows)':>11}")
+            continue
+        accelerator.print(
+            f"  {emotion:<10}{losses['main_loss']:>11.4f}"
+            f"{losses['sub_talker_loss']:>11.4f}{losses['total_loss']:>11.4f}"
+        )
+        ranked.append((losses["total_loss"], emotion))
+    if len(ranked) > 1:
+        ranked.sort()
+        accelerator.print(
+            f"  best {ranked[0][1]} {ranked[0][0]:.4f} | "
+            f"worst {ranked[-1][1]} {ranked[-1][0]:.4f}"
+        )
+
+
+def write_emotion_loss_rows(writer, csv_file, record_type, epoch, global_step, split, results):
+    """Long format, one row per (split, emotion), so adding an emotion later
+    needs no schema change."""
+    if writer is None:
+        return
+    for emotion in EMOTIONS:
+        losses = results.get(emotion)
+        if losses is None:
+            continue
+        writer.writerow(
+            {
+                "record_type": record_type,
+                "epoch": epoch,
+                "global_step": global_step,
+                "split": split,
+                "emotion": emotion,
+                "main_loss": losses["main_loss"],
+                "sub_talker_loss": losses["sub_talker_loss"],
+                "total_loss": losses["total_loss"],
+            }
+        )
+    csv_file.flush()
 
 
 def current_lr(optimizer):
@@ -394,7 +669,7 @@ def write_loss_row(
     csv_file.flush()
 
 
-def save_final_model(accelerator, model, model_path, output_model_path, speaker_name):
+def save_final_model(accelerator, model, emotion_table, model_path, output_model_path, speaker_name):
     if not accelerator.is_main_process:
         return
     source_model_path = model_path
@@ -418,13 +693,22 @@ def save_final_model(accelerator, model, model_path, output_model_path, speaker_
         config_dict = json.load(f)
     config_dict["tts_model_type"] = "custom_voice"
     talker_config = config_dict.get("talker_config", {})
+
+    # One registered speaker name per emotion. Inference performs a single
+    # embedding lookup, so the "speaker + emotion" sum is precomputed here and
+    # stored as six separate rows; generate_custom_voice() needs no changes.
+    emotion_speaker_names = {
+        emotion: f"{speaker_name}_{emotion}" for emotion in EMOTIONS
+    }
     talker_config["spk_id"] = {
-        speaker_name: 3000
+        emotion_speaker_names[emotion]: SPEAKER_SLOT_START + index
+        for index, emotion in enumerate(EMOTIONS)
     }
     talker_config["spk_is_dialect"] = {
-        speaker_name: False
+        name: False for name in emotion_speaker_names.values()
     }
     config_dict["talker_config"] = talker_config
+    config_dict["emotion_speakers"] = emotion_speaker_names
 
     with open(output_config_file, 'w', encoding='utf-8') as f:
         json.dump(config_dict, f, indent=2, ensure_ascii=False)
@@ -442,11 +726,36 @@ def save_final_model(accelerator, model, model_path, output_model_path, speaker_
         del state_dict[k]
 
     weight = state_dict['talker.model.codec_embedding.weight']
-    state_dict['talker.model.codec_embedding.weight'][3000] = (
-        target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
-    )
+    last_slot = SPEAKER_SLOT_START + len(EMOTIONS)
+    if last_slot > weight.shape[0]:
+        raise ValueError(
+            f"codec_embedding has {weight.shape[0]} rows but slots up to {last_slot} "
+            "are required; lower SPEAKER_SLOT_START or reduce the emotion count"
+        )
+
+    speaker_vector = target_speaker_embedding[0].detach().to("cpu").float()
+    emotion_weight = accelerator.unwrap_model(emotion_table).weight.detach().to("cpu").float()
+
+    report_speaker_drift(accelerator)
+    report_emotion_table(emotion_weight, accelerator, speaker_vector)
+
+    for index, emotion in enumerate(EMOTIONS):
+        combined = speaker_vector + emotion_weight[index]
+        weight[SPEAKER_SLOT_START + index] = combined.to(weight.device).to(weight.dtype)
+        accelerator.print(
+            f"codec_embedding[{SPEAKER_SLOT_START + index}] <- "
+            f"{emotion_speaker_names[emotion]}"
+        )
+
     save_path = os.path.join(output_dir, "model.safetensors")
     save_file(state_dict, save_path)
+
+    # The raw table is not part of the model; keep it for inspection and for
+    # rebuilding the rows without retraining.
+    torch.save(
+        {"emotions": EMOTIONS, "emotion_weight": emotion_weight, "speaker_vector": speaker_vector},
+        os.path.join(output_model_path, "emotion_table.pt"),
+    )
 
 
 def train():
@@ -474,26 +783,53 @@ def train():
     train_data = load_jsonl(args.train_jsonl, "train")
     val_data = load_jsonl(args.val_jsonl, "validation")
     test_data = load_jsonl(args.test_jsonl, "test")
+    report_emotion_counts(
+        {"train": train_data, "val": val_data, "test": test_data}, accelerator
+    )
     train_dataloader = build_dataloader(train_data, qwen3tts.processor, config, args.batch_size, shuffle=True)
     val_dataloader = build_dataloader(val_data, qwen3tts.processor, config, args.batch_size, shuffle=False)
     test_dataloader = build_dataloader(test_data, qwen3tts.processor, config, args.batch_size, shuffle=False)
+
+    emotion_table = build_emotion_table(config.talker_config.hidden_size, accelerator)
 
     trainable_parameters = [
         parameter
         for parameter in qwen3tts.model.parameters()
         if parameter.requires_grad
     ]
-    optimizer = AdamW(trainable_parameters, lr=args.lr, weight_decay=0.01)
+    optimizer = AdamW(
+        [
+            {"params": trainable_parameters, "lr": args.lr},
+            # No weight decay: decaying towards zero would actively erase the
+            # emotion offsets we are trying to learn.
+            {"params": list(emotion_table.parameters()), "lr": args.emotion_lr, "weight_decay": 0.0},
+        ],
+        lr=args.lr,
+        weight_decay=0.01,
+    )
 
-    model, optimizer, train_dataloader, val_dataloader, test_dataloader = accelerator.prepare(
-        qwen3tts.model, optimizer, train_dataloader, val_dataloader, test_dataloader
+    model, emotion_table, optimizer, train_dataloader, val_dataloader, test_dataloader = accelerator.prepare(
+        qwen3tts.model, emotion_table, optimizer, train_dataloader, val_dataloader, test_dataloader
+    )
+    emotion_loaders = (
+        build_emotion_dataloaders(
+            {"val": val_data, "test": test_data},
+            qwen3tts.processor,
+            config,
+            args.batch_size,
+            accelerator,
+        )
+        if args.emotion_eval_every > 0
+        else {}
     )
     num_epochs = args.num_epochs
     model.train()
+    emotion_table.train()
     global_step = 0
     best_val_loss = None
     best_epoch = 0
     best_model_state = None
+    best_emotion_state = None
     completed_epochs = 0
 
     csv_file = None
@@ -524,6 +860,27 @@ def train():
         writer.writeheader()
         csv_file.flush()
 
+    emotion_csv_file = None
+    emotion_writer = None
+    if accelerator.is_main_process and emotion_loaders:
+        emotion_csv_path = os.path.join(args.output_model_path, "emotion_loss_history.csv")
+        emotion_csv_file = open(emotion_csv_path, "w", encoding="utf-8", newline="")
+        emotion_writer = csv.DictWriter(
+            emotion_csv_file,
+            fieldnames=[
+                "record_type",
+                "epoch",
+                "global_step",
+                "split",
+                "emotion",
+                "main_loss",
+                "sub_talker_loss",
+                "total_loss",
+            ],
+        )
+        emotion_writer.writeheader()
+        emotion_csv_file.flush()
+
     for epoch in range(num_epochs):
         train_stats = _empty_loss_stats()
         epoch_gradient_norm_sum = 0.0
@@ -533,7 +890,7 @@ def train():
             if args.max_train_batches is not None and step >= args.max_train_batches:
                 break
             with accelerator.accumulate(model):
-                loss, batch_stats, speaker_embedding = compute_loss(model, batch)
+                loss, batch_stats, speaker_embedding = compute_loss(model, batch, emotion_table)
                 loss_is_finite = torch.isfinite(loss.detach()).all()
                 if not bool(loss_is_finite.item()):
                     epoch_has_nan_or_inf = True
@@ -546,7 +903,9 @@ def train():
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
-                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    grad_norm = accelerator.clip_grad_norm_(
+                        itertools.chain(model.parameters(), emotion_table.parameters()), 1.0
+                    )
                     grad_norm_value = float(grad_norm.detach().float().item())
                     if not torch.isfinite(grad_norm.detach()).all():
                         epoch_has_nan_or_inf = True
@@ -568,7 +927,7 @@ def train():
                 )
 
         train_losses = finalize_loss(train_stats)
-        val_losses = evaluate(model, val_dataloader, accelerator, args.max_eval_batches)
+        val_losses = evaluate(model, val_dataloader, accelerator, emotion_table, args.max_eval_batches)
         train_loss = train_losses["total_loss"]
         val_loss = val_losses["total_loss"]
         epoch_gradient_norm = (
@@ -579,6 +938,7 @@ def train():
             best_val_loss = val_loss
             best_epoch = epoch + 1
             best_model_state = clone_model_state(model, accelerator)
+            best_emotion_state = clone_model_state(emotion_table, accelerator)
 
         lr = current_lr(optimizer)
         completed_epochs = epoch + 1
@@ -609,6 +969,24 @@ def train():
                 epoch_has_nan_or_inf,
             )
 
+        if emotion_loaders and (epoch + 1) % args.emotion_eval_every == 0:
+            val_emotion_losses = evaluate_by_emotion(
+                model, emotion_loaders, "val", accelerator, emotion_table, args.max_eval_batches
+            )
+            report_emotion_losses(
+                val_emotion_losses, accelerator, f"Epoch {epoch + 1} validation"
+            )
+            if accelerator.is_main_process:
+                write_emotion_loss_rows(
+                    emotion_writer,
+                    emotion_csv_file,
+                    "epoch",
+                    epoch + 1,
+                    global_step,
+                    "val",
+                    val_emotion_losses,
+                )
+
     if best_model_state is None:
         raise ValueError("No validation result was recorded; cannot restore best model for final test")
     accelerator.print(
@@ -616,9 +994,11 @@ def train():
         "before final test."
     )
     load_model_state(model, accelerator, best_model_state)
+    load_model_state(emotion_table, accelerator, best_emotion_state)
     model.train()
+    emotion_table.train()
 
-    test_losses = evaluate(model, test_dataloader, accelerator, args.max_eval_batches)
+    test_losses = evaluate(model, test_dataloader, accelerator, emotion_table, args.max_eval_batches)
     test_loss = test_losses["total_loss"]
     lr = current_lr(optimizer)
     accelerator.print(
@@ -626,6 +1006,13 @@ def train():
         f"Current LR {lr:.10g} | Test main/sub/total: {test_losses['main_loss']:.6f}/"
         f"{test_losses['sub_talker_loss']:.6f}/{test_losses['total_loss']:.6f}"
     )
+    test_emotion_losses = {}
+    if emotion_loaders:
+        test_emotion_losses = evaluate_by_emotion(
+            model, emotion_loaders, "test", accelerator, emotion_table, args.max_eval_batches
+        )
+        report_emotion_losses(test_emotion_losses, accelerator, "Final test")
+
     if accelerator.is_main_process:
         write_loss_row(
             writer,
@@ -641,9 +1028,22 @@ def train():
             False,
         )
         csv_file.close()
+        if emotion_csv_file is not None:
+            write_emotion_loss_rows(
+                emotion_writer,
+                emotion_csv_file,
+                "final_test",
+                completed_epochs,
+                global_step,
+                "test",
+                test_emotion_losses,
+            )
+            emotion_csv_file.close()
 
     accelerator.wait_for_everyone()
-    save_final_model(accelerator, model, MODEL_PATH, args.output_model_path, args.speaker_name)
+    save_final_model(
+        accelerator, model, emotion_table, MODEL_PATH, args.output_model_path, args.speaker_name
+    )
     accelerator.wait_for_everyone()
 
 

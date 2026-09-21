@@ -30,6 +30,12 @@ AudioLike = Union[
 
 MaybeList = Union[Any, List[Any]]
 
+# Emotion table row order. This order is baked into the saved checkpoint, so it
+# must stay fixed once a model has been trained with it.
+EMOTIONS = ["anger", "disgust", "fear", "happy", "sad", "surprise"]
+EMOTION_TO_ID = {name: index for index, name in enumerate(EMOTIONS)}
+
+
 class TTSDataset(Dataset):
     def __init__(self, data_list, processor, config:Qwen3TTSConfig, lag_num = -1):
         self.data_list = data_list
@@ -125,6 +131,18 @@ class TTSDataset(Dataset):
         audio_codes = item["audio_codes"]
         language        = item.get('language','Auto')
         ref_audio_path  = item['ref_audio']
+        emotion         = item.get('emotion')
+
+        # Optional so the speaker-only scripts keep working unchanged; the
+        # emotion-conditioned trainer validates the field when loading the JSONL.
+        if emotion is None:
+            emotion_id = -1
+        elif emotion in EMOTION_TO_ID:
+            emotion_id = EMOTION_TO_ID[emotion]
+        else:
+            raise ValueError(
+                f"Unknown emotion {emotion!r}; expected one of {EMOTIONS}"
+            )
 
         text = self._build_assistant_text(text)
         text_ids = self._tokenize_texts(text)
@@ -140,7 +158,8 @@ class TTSDataset(Dataset):
         return {
             "text_ids": text_ids[:,:-5],    # 1 , t
             "audio_codes":audio_codes,      # t, 16
-            "ref_mel":ref_mel
+            "ref_mel":ref_mel,
+            "emotion_id":emotion_id,        # index into the emotion table
         }
         
     def collate_fn(self, batch):
@@ -206,9 +225,12 @@ class TTSDataset(Dataset):
         ref_mels = [data['ref_mel'] for data in batch]
         ref_mels = torch.cat(ref_mels,dim=0)
 
+        emotion_ids = torch.tensor([data['emotion_id'] for data in batch], dtype=torch.long)
+
         return {
             'input_ids':input_ids,
             'ref_mels':ref_mels,
+            'emotion_ids':emotion_ids,
             'attention_mask':attention_mask,
             'text_embedding_mask':text_embedding_mask.unsqueeze(-1),
             'codec_embedding_mask':codec_embedding_mask.unsqueeze(-1),
