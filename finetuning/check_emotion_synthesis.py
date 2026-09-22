@@ -28,13 +28,22 @@ import soundfile as sf
 EMOTIONS = ["anger", "disgust", "fear", "happy", "sad", "surprise"]
 
 # Deliberately emotion-neutral: nothing in the wording implies a mood, so any
-# difference in the output has to come from the emotion vector.
-DEFAULT_SENTENCES = [
-    "明日の会議は午後三時からです。",
-    "駅前の書店で本を三冊買いました。",
-    "今週の天気は曇りのち晴れだそうです。",
-    "資料は机の上に置いてあります。",
-]
+# difference in the output has to come from the emotion vector. The two lists
+# say the same four things, which keeps a cross-language run comparable.
+SENTENCES = {
+    "Chinese": [
+        "明天的會議從3點開始。",
+        "我在車站前的便利商店買了飲料。",
+        "本周的天氣是多雲到晴。",
+        "資料就放在電腦的主機上。",
+    ],
+    "Japanese": [
+        "明日の会議は午後三時からです。",
+        "駅前の書店で本を三冊買いました。",
+        "今週の天気は曇りのち晴れだそうです。",
+        "資料は机の上に置いてあります。",
+    ],
+}
 
 
 def parse_args():
@@ -43,7 +52,10 @@ def parse_args():
     parser.add_argument("--speaker", default="F2", help="--speaker_name used during training")
     parser.add_argument("--out", default="emotion_probe", help="Directory for the generated wavs")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--language", default="Japanese")
+    parser.add_argument("--language", default="Chinese", choices=sorted(SENTENCES))
+    # Same default as the training script, so a run here lines up with the run
+    # that produced the checkpoint.
+    parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--greedy", action="store_true", help="Also generate a greedy set for comparison")
     # A range this wide invites octave errors. These defaults suit a female
     # speaker; for a male one use roughly --fmin 70 --fmax 250.
@@ -134,15 +146,16 @@ def main():
         print(f"Speakers present in the checkpoint: {supported}", file=sys.stderr)
         raise SystemExit(f"Missing speakers: {missing}. Check --speaker matches --speaker_name.")
 
+    sentences = SENTENCES[args.language]
     passes = [("sampled", {"do_sample": True, "temperature": 0.9, "top_p": 0.9})]
     if args.greedy:
         passes.append(("greedy", {"do_sample": False}))
 
     for tag, gen_kwargs in passes:
         rows = {emotion: [] for emotion in EMOTIONS}
-        for index, text in enumerate(DEFAULT_SENTENCES):
+        for index, text in enumerate(sentences):
             for emotion in EMOTIONS:
-                torch.manual_seed(1234)
+                torch.manual_seed(args.seed)
                 wavs, sr = tts.generate_custom_voice(
                     text=text,
                     speaker=f"{args.speaker}_{emotion}",
@@ -155,7 +168,8 @@ def main():
                 if measured is None:
                     raise SystemExit(f"Could not measure F0 in {path}; listen to it first.")
                 rows[emotion].append(measured)
-        report(rows, f"{tag} decoding | {len(DEFAULT_SENTENCES)} sentences x {len(EMOTIONS)} emotions")
+        report(rows, f"{tag} decoding | {args.language} | "
+                     f"{len(sentences)} sentences x {len(EMOTIONS)} emotions | seed {args.seed}")
 
     print(f"\nWavs written to {os.path.abspath(args.out)} -- listen to them before trusting any table.")
 
