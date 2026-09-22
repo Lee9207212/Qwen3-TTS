@@ -178,6 +178,50 @@ wavs, sr = tts.generate_custom_voice(
 ```
 
 
+### Diagnosing a run where the emotion vectors do not seem to do anything
+
+`loss_history.csv` cannot tell you whether emotion conditioning worked. On a
+corpus where the text already implies the emotion, a model with dead emotion
+vectors and one with working vectors score almost the same teacher-forcing
+cross-entropy, because both can read the emotion off the transcript. Two
+scripts cover what the loss curves miss.
+
+**`check_text_leakage.py` -- is the emotion already in the text?**
+
+```bash
+python3 finetuning/check_text_leakage.py <train.jsonl> <val.jsonl>
+```
+
+Fits a character-n-gram classifier on the transcripts alone (no tokenizer
+needed, so it works for Japanese) and reports how well the emotion label can be
+recovered from text without hearing any audio. Accuracy far above chance means
+the emotion vectors are competing against a free and much stronger signal: the
+model can minimise the loss by reading the words, so little gradient is left
+for the table. It also prints the most emotion-predictive n-grams, which is
+usually enough to see which words are leaking.
+
+Corpora whose scripts were written per emotion -- JVNV and JTES among them --
+leak heavily by construction, and the leak cannot be cleaned away, because the
+transcript has to match what was actually spoken.
+
+**`check_emotion_synthesis.py` -- do the vectors change the audio?**
+
+```bash
+python3 finetuning/check_emotion_synthesis.py output/final_model --speaker F2
+```
+
+Synthesises the same emotion-neutral sentences under every emotion and compares
+pitch, pitch range, energy and speaking rate. Decoding is greedy by default so
+that differences between the six outputs come from the emotion vector rather
+than from sampling noise; `--sample` adds a sampled pass for listening.
+
+Alongside the per-emotion table it reports an effect size for each feature:
+the variance explained by the emotion divided by the variance explained by the
+choice of sentence. Below 1.0 means swapping the emotion matters less than
+swapping the sentence, which is the quantitative form of "the vectors are not
+doing anything". Listen to the wavs regardless -- the table is corroboration,
+not the verdict.
+
 ### One-click shell script example
 
 ```bash
