@@ -700,12 +700,18 @@ def save_final_model(accelerator, model, emotion_table, model_path, output_model
     emotion_speaker_names = {
         emotion: f"{speaker_name}_{emotion}" for emotion in EMOTIONS
     }
+    # Registered lower-cased on purpose. The released qwen-tts package looks a
+    # speaker up as `spk_id[speaker.lower()]`, so a key like "F2_anger" is
+    # unreachable there and generation fails with "Speaker ... not implemented".
+    # Lower-cased keys resolve under that lookup and under the case-insensitive
+    # one in this repo, so the exported checkpoint works with either version.
+    # Callers still pass whatever casing they like.
     talker_config["spk_id"] = {
-        emotion_speaker_names[emotion]: SPEAKER_SLOT_START + index
+        emotion_speaker_names[emotion].lower(): SPEAKER_SLOT_START + index
         for index, emotion in enumerate(EMOTIONS)
     }
     talker_config["spk_is_dialect"] = {
-        name: False for name in emotion_speaker_names.values()
+        name.lower(): False for name in emotion_speaker_names.values()
     }
     config_dict["talker_config"] = talker_config
     config_dict["emotion_speakers"] = emotion_speaker_names
