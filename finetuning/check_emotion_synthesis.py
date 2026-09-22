@@ -7,9 +7,11 @@ the emotion, a model with dead emotion vectors and a model with working ones
 score almost the same teacher-forcing CE. The only decisive test is to hold the
 text fixed, vary the emotion vector, and look at the audio that comes out.
 
-Decoding is greedy by default (do_sample=False) so that every difference
-between the six outputs is attributable to the emotion vector rather than to
-sampling noise. Pass --sample to hear the sampled version as well.
+Decoding samples with a fixed seed re-applied before every call, so the six
+emotions are compared under matched randomness while still producing audio the
+model is actually good at. Greedy decoding would be more deterministic but a
+codec LM tends to degenerate under it, and prosody measured off degenerate
+audio is meaningless. Pass --greedy to compare the two.
 
 Usage:
     python3 finetuning/check_emotion_synthesis.py output/final_model --speaker F2 --out wavs/
@@ -42,9 +44,11 @@ def parse_args():
     parser.add_argument("--out", default="emotion_probe", help="Directory for the generated wavs")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--language", default="Japanese")
-    parser.add_argument("--sample", action="store_true", help="Also generate a sampled (non-greedy) set")
-    parser.add_argument("--fmin", type=float, default=80.0, help="F0 floor; lower it for a male speaker")
-    parser.add_argument("--fmax", type=float, default=500.0)
+    parser.add_argument("--greedy", action="store_true", help="Also generate a greedy set for comparison")
+    # A range this wide invites octave errors. These defaults suit a female
+    # speaker; for a male one use roughly --fmin 70 --fmax 250.
+    parser.add_argument("--fmin", type=float, default=120.0)
+    parser.add_argument("--fmax", type=float, default=350.0)
     return parser.parse_args()
 
 
@@ -58,6 +62,9 @@ def prosody(wav, sr, text, fmin, fmax):
     voiced_f0 = f0[~np.isnan(f0)]
     if voiced_f0.size < 5:
         return None
+    # Speech sits near 40-70% voiced. Far below that means the tracker lost the
+    # signal, and every pitch number below it is noise.
+    voiced_ratio = float(voiced_f0.size) / float(f0.size)
     # Pitch in semitones so the spread is comparable across speakers.
     semitones = 12.0 * np.log2(voiced_f0 / np.median(voiced_f0))
     rms = float(np.sqrt(np.mean(wav ** 2)) + 1e-9)
@@ -66,6 +73,7 @@ def prosody(wav, sr, text, fmin, fmax):
         "f0_spread": float(np.percentile(semitones, 90) - np.percentile(semitones, 10)),
         "energy_db": float(20.0 * np.log10(rms)),
         "chars_per_sec": len(text) / duration if duration > 0 else 0.0,
+        "voiced_ratio": voiced_ratio,
         "duration": duration,
     }
 
@@ -75,6 +83,7 @@ FEATURES = [
     ("f0_spread", "音高起伏 (半音)"),
     ("energy_db", "能量 (dB)"),
     ("chars_per_sec", "語速 (字/秒)"),
+    ("voiced_ratio", "有聲比例 (健檢)"),
 ]
 
 
@@ -125,9 +134,9 @@ def main():
         print(f"Speakers present in the checkpoint: {supported}", file=sys.stderr)
         raise SystemExit(f"Missing speakers: {missing}. Check --speaker matches --speaker_name.")
 
-    passes = [("greedy", {"do_sample": False})]
-    if args.sample:
-        passes.append(("sampled", {"do_sample": True, "temperature": 0.9, "top_p": 0.9}))
+    passes = [("sampled", {"do_sample": True, "temperature": 0.9, "top_p": 0.9})]
+    if args.greedy:
+        passes.append(("greedy", {"do_sample": False}))
 
     for tag, gen_kwargs in passes:
         rows = {emotion: [] for emotion in EMOTIONS}
