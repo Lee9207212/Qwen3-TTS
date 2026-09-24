@@ -213,6 +213,30 @@ throughout training and would add noise to the difference.
 python3 Qwen3-TTS/finetuning/sft_12hz_Lora.py   --dataset_dir <data> --speaker_name F2   --freeze_lora_epochs 5 --select_by emotion_delta
 ```
 
+### Changing the emotion strength without retraining
+
+`--emotion_scale` multiplies the emotion offsets as they are baked into the
+exported rows, but it only runs at the end of training. To try a different
+strength on a checkpoint you already have, re-bake it:
+
+```bash
+python3 finetuning/rebake_emotion_scale.py output/final_model --scale 2.0
+```
+
+Training keeps the unscaled speaker vector and emotion offsets in
+`emotion_table.pt`, so the rows can be rebuilt from scratch. The script reads
+the name-to-row mapping out of the checkpoint's own `config.json` rather than
+assuming slot numbers, writes a new directory and leaves the original alone.
+Sweep 1.0 / 2.0 / 3.0 and run `check_emotion_synthesis.py` on each.
+
+Only the offset is scaled; the speaker vector is untouched, so timbre stays put
+and the offset is pushed further along the direction it already encodes. This
+needs a model trained with `--emotion_dropout`. Without it the emotion vector
+was present at full strength in every training step, so the model has never
+seen it vary and there is no learned behaviour to extrapolate -- larger values
+then distort the voice instead of intensifying the emotion. Past some point
+that happens regardless, so listen rather than trusting the effect sizes.
+
 ### Diagnosing a run where the emotion vectors do not seem to do anything
 
 `loss_history.csv` cannot tell you whether emotion conditioning worked. On a
