@@ -194,55 +194,49 @@ tests the competition explanation directly: if the emotion effect grows, the
 table was being crowded out; if nothing moves, it has hit its capacity and the
 conditioning channel itself needs to change.
 
-**`--select_by emotion_delta`** changes which checkpoint is kept. Validation
-loss cannot see whether emotion conditioning works -- when the transcript
-implies the emotion, a dead emotion table and a working one score nearly the
-same, so selecting on it is close to selecting at random with respect to the
-thing being trained. Every epoch now also evaluates the validation set with the
-emotion offsets zeroed and logs the gap as `val_emotion_delta` in
-`loss_history.csv`. A larger gap means the emotion vectors are carrying more of
-the prediction. `--select_by emotion_delta` keeps the epoch that maximises it;
-the default `val_loss` preserves the old behaviour. The column is written
-either way, so a plain run still shows where the emotion effect peaks -- and
-that epoch is usually not the one with the lowest validation loss.
+**Two ablation metrics** replace validation loss as the thing to watch.
+Validation loss cannot see whether emotion conditioning works: when the
+transcript already implies the emotion, a dead emotion table and a working one
+score nearly the same, so selecting on it is close to selecting at random with
+respect to the thing being trained. Both metrics are logged every epoch in
+`loss_history.csv` whatever `--select_by` is set to.
 
-Only `main_loss` enters the delta. The sub-talker term sits on a plateau
+`val_emotion_delta` re-runs validation with the emotion offsets zeroed and
+reports how much worse the model gets. It answers **does the table contribute
+at all**.
+
+`val_emotion_shuffle_delta` re-runs it with `emotion_id -> (emotion_id + 1) % 6`
+instead, so every sample is handed another emotion's vector. It answers **can
+the model tell the six emotions apart**, which is what emotion control actually
+requires.
+
+Report the shuffle delta. Zeroing conflates two things, because it removes both
+"the six differ" and "the table learned anything". Consider six vectors that
+trained to be identical: every emotion then produces the same audio, so emotion
+control has failed completely -- yet zeroing them still hurts, because that one
+shared vector did learn something, and the zero delta comes out large and
+flattering. The shuffle delta correctly reports zero, since swapping identical
+vectors changes nothing. A frozen-adapter run reached a mean pairwise cosine of
+0.67 between the six vectors against 0.25 for ordinary joint training, so this
+is a real failure mode here rather than a hypothetical one.
+
+The shift is a cyclic permutation, chosen so that each vector is still used
+exactly as often as it was: only the sample-to-vector pairing changes, and a
+loss increase therefore cannot be blamed on some vector being over-represented.
+A shift of 1 is not a multiple of six, so no sample keeps its own vector. Any
+fixed shift in 1..5 would serve; 1 is simply the smallest. Averaging all five is
+the thorough version and costs four more validation passes.
+
+`--select_by` takes `val_loss` (the default), `emotion_delta` or
+`emotion_shuffle`, and keeps the epoch that is best by that measure. The peak of
+either delta is usually not the epoch with the lowest validation loss.
+
+Only `main_loss` enters both deltas. The sub-talker term sits on a plateau
 throughout training and would add noise to the difference.
 
 ```bash
-python3 Qwen3-TTS/finetuning/sft_12hz_Lora.py   --dataset_dir <data> --speaker_name F2   --freeze_lora_epochs 5 --select_by emotion_delta
+python3 finetuning/sft_12hz_Lora.py   --dataset_dir <data> --speaker_name F2   --freeze_lora_epochs 5 --select_by emotion_shuffle
 ```
-
-### Keeping the emotion table from absorbing what is not emotion
-
-`--center_emotion_table` subtracts the mean row on every lookup, so the six
-vectors the model sees always sum to zero.
-
-Nothing otherwise stops all six from drifting the same way. Early in training --
-and especially with `--freeze_lora_epochs`, where the table is the only thing
-learning -- the largest unexplained thing is the shift from the base model's
-default voice to this corpus, and that shift is identical across emotions. The
-table absorbs it, and the result is six near-parallel vectors: in one frozen run
-the mean pairwise cosine reached 0.67, against 0.25 for ordinary joint training.
-Six vectors pointing the same way give no emotion control at all, because every
-emotion then produces the same output.
-
-This also repairs `val_emotion_delta`. Zeroing the vectors removes the table's
-whole contribution, shared part included, so a shared component inflates the
-number -- six identical vectors would score a large delta while controlling
-nothing. Once the rows sum to zero their mean is the zero vector, so zeroing and
-substituting the mean become the same operation and the delta measures only what
-differs between emotions. `val_emotion_shuffle_delta` answers the same question
-from the other side and does not depend on this flag.
-
-The constraint is applied at lookup rather than by editing weights between
-steps, which keeps it exactly satisfied and lets the gradient carry it: each
-row's gradient picks up a term from all six. Export bakes `effective_weight()`,
-so a checkpoint always behaves like the model that was validated, and
-`emotion_table.pt` keeps both the baked rows and the raw parameter.
-
-Off by default, so existing runs stay comparable. Turn it on for new
-comparisons, and do not read a centered delta against an uncentered one.
 
 ### Changing the emotion strength without retraining
 
