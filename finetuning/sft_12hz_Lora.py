@@ -391,13 +391,18 @@ def _ensure_path_exists(value, field_name, path, line_no):
             )
 
 
-def load_jsonl(path, split_name):
+def load_jsonl(path, split_name, require_emotion=True):
     if not os.path.isfile(path):
         raise FileNotFoundError(f"{split_name} JSONL does not exist: {path}")
     if os.path.getsize(path) == 0:
         raise ValueError(f"{split_name} JSONL is empty: {path}")
 
-    required_fields = {"audio", "text", "ref_audio", "audio_codes", "emotion"}
+    # 'emotion' is optional for deliberately emotion-free runs (--emotion_lr 0),
+    # which lets manifests predating the emotion field be reused unchanged. Rows
+    # without it get emotion=None, which compute_loss turns into a zero offset.
+    required_fields = {"audio", "text", "ref_audio", "audio_codes"}
+    if require_emotion:
+        required_fields = required_fields | {"emotion"}
     rows = []
     with open(path, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, 1):
@@ -413,7 +418,8 @@ def load_jsonl(path, split_name):
                 raise ValueError(f"{path}:{line_no} missing fields: {sorted(missing)}")
             if not isinstance(item["text"], str):
                 raise ValueError(f"{path}:{line_no} field 'text' must be a string")
-            if item["emotion"] not in EMOTION_TO_ID:
+            item.setdefault("emotion", None)
+            if item["emotion"] is not None and item["emotion"] not in EMOTION_TO_ID:
                 raise ValueError(
                     f"{path}:{line_no} field 'emotion' is {item['emotion']!r}; "
                     f"expected one of {EMOTIONS}"
@@ -464,6 +470,10 @@ def compute_loss(model, batch, emotion_table, zero_emotion=False,
     speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
     track_speaker_drift(speaker_embedding, target_speaker_embedding)
     emotion_ids = emotion_ids.to(model.device)
+    # -1 marks a row with no emotion label. nn.Embedding cannot take it, so look
+    # row 0 up and mask the result to zero: the same "speaker only" state the
+    # table starts from.
+    emotion_present = (emotion_ids >= 0).unsqueeze(-1)
     if shift_emotion:
         # Hand every sample a different emotion's vector. This is a cyclic
         # permutation, so each vector is still used exactly as often as before
@@ -473,7 +483,7 @@ def compute_loss(model, batch, emotion_table, zero_emotion=False,
         shifted = (emotion_ids + shift_emotion) % len(EMOTIONS)
         emotion_ids = torch.where(emotion_ids >= 0, shifted, emotion_ids)
     # NOT detached: this is the only path by which the emotion table learns.
-    emotion_embedding = emotion_table(emotion_ids)
+    emotion_embedding = emotion_table(emotion_ids.clamp(min=0)) * emotion_present
     if emotion_dropout > 0.0:
         # Per sample, not per batch. The model sees both conditions during
         # training and has to tell them apart.
@@ -904,9 +914,18 @@ def train():
     qwen3tts.model = apply_lora(qwen3tts.model, args, accelerator)
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
-    train_data = load_jsonl(args.train_jsonl, "train")
-    val_data = load_jsonl(args.val_jsonl, "validation")
-    test_data = load_jsonl(args.test_jsonl, "test")
+    train_data = load_jsonl(
+        args.train_jsonl, "train",
+        require_emotion=args.emotion_lr > 0,
+    )
+    val_data = load_jsonl(
+        args.val_jsonl, "validation",
+        require_emotion=args.emotion_lr > 0,
+    )
+    test_data = load_jsonl(
+        args.test_jsonl, "test",
+        require_emotion=args.emotion_lr > 0,
+    )
     report_emotion_counts(
         {"train": train_data, "val": val_data, "test": test_data}, accelerator,
         require_all=args.emotion_lr > 0,
