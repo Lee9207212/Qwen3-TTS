@@ -151,8 +151,33 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--emotion_dropout",
+        type=float,
+        default=0.0,
+        help=(
+            "Probability of zeroing a sample's emotion vector during training. "
+            "With it the model has to behave differently with and without the "
+            "offset, so it cannot make the emotion table redundant -- which is "
+            "what the adapters otherwise do once they are unfrozen. It also "
+            "makes --emotion_scale meaningful at inference."
+        ),
+    )
+    parser.add_argument(
+        "--emotion_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier applied to the emotion offsets when they are baked into "
+            "the exported checkpoint. 1.0 reproduces training; above 1.0 pushes "
+            "further along the direction the offset already encodes, which is a "
+            "strength knob that costs no retraining. Train with --emotion_dropout "
+            "first, otherwise the model has never seen the offset vary and "
+            "extrapolating it is not meaningful."
+        ),
+    )
+    parser.add_argument(
         "--select_by",
-        choices=("val_loss", "emotion_delta"),
+        choices=("val_loss", "emotion_delta", "emotion_shuffle"),
         default="val_loss",
         help=(
             "Checkpoint selection criterion. val_loss cannot see whether emotion "
@@ -409,7 +434,8 @@ def build_dataloader(data, processor, config, batch_size, shuffle):
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=dataset.collate_fn)
 
 
-def compute_loss(model, batch, emotion_table, zero_emotion=False):
+def compute_loss(model, batch, emotion_table, zero_emotion=False,
+                 shift_emotion=0, emotion_dropout=0.0):
     input_ids = batch['input_ids']
     codec_ids = batch['codec_ids']
     ref_mels = batch['ref_mels']
@@ -424,8 +450,25 @@ def compute_loss(model, batch, emotion_table, zero_emotion=False):
     # ref_audio this vector is a constant for the whole run.
     speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
     track_speaker_drift(speaker_embedding, target_speaker_embedding)
+    emotion_ids = emotion_ids.to(model.device)
+    if shift_emotion:
+        # Hand every sample a different emotion's vector. This is a cyclic
+        # permutation, so each vector is still used exactly as often as before
+        # and only the sample-to-vector pairing changes; a loss increase cannot
+        # be blamed on some vector being over-represented. The shift is never a
+        # multiple of len(EMOTIONS), so no sample keeps its own vector.
+        shifted = (emotion_ids + shift_emotion) % len(EMOTIONS)
+        emotion_ids = torch.where(emotion_ids >= 0, shifted, emotion_ids)
     # NOT detached: this is the only path by which the emotion table learns.
-    emotion_embedding = emotion_table(emotion_ids.to(model.device))
+    emotion_embedding = emotion_table(emotion_ids)
+    if emotion_dropout > 0.0:
+        # Per sample, not per batch. The model sees both conditions during
+        # training and has to tell them apart.
+        keep = (
+            torch.rand(emotion_embedding.shape[0], device=emotion_embedding.device)
+            >= emotion_dropout
+        )
+        emotion_embedding = emotion_embedding * keep.unsqueeze(-1)
     # Ablation for the emotion_delta metric: keep every other input identical and
     # drop only the emotion offset, so the loss difference is attributable to it.
     if zero_emotion:
@@ -524,7 +567,8 @@ def finalize_loss(total_stats):
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, accelerator, emotion_table, max_batches=None, zero_emotion=False):
+def evaluate(model, dataloader, accelerator, emotion_table, max_batches=None,
+             zero_emotion=False, shift_emotion=0):
     model.eval()
     emotion_table.eval()
     total_stats = _empty_loss_stats()
@@ -532,7 +576,8 @@ def evaluate(model, dataloader, accelerator, emotion_table, max_batches=None, ze
         if max_batches is not None and step >= max_batches:
             break
         _loss, batch_stats, _speaker_embedding = compute_loss(
-            model, batch, emotion_table, zero_emotion=zero_emotion
+            model, batch, emotion_table,
+            zero_emotion=zero_emotion, shift_emotion=shift_emotion,
         )
         add_loss_stats(total_stats, batch_stats, accelerator)
     model.train()
@@ -682,6 +727,7 @@ def write_loss_row(
     gradient_norm=None,
     has_nan_or_inf=False,
     emotion_delta=None,
+    emotion_shuffle_delta=None,
 ):
     def get_loss(losses, key):
         if losses is None:
@@ -705,6 +751,7 @@ def write_loss_row(
         "val_sub_talker_loss": fmt_loss(get_loss(val_losses, "sub_talker_loss")),
         "val_total_loss": fmt_loss(get_loss(val_losses, "total_loss")),
         "val_emotion_delta": fmt_loss(emotion_delta),
+        "val_emotion_shuffle_delta": fmt_loss(emotion_shuffle_delta),
         "test_main_loss": fmt_loss(get_loss(test_losses, "main_loss")),
         "test_sub_talker_loss": fmt_loss(get_loss(test_losses, "sub_talker_loss")),
         "test_total_loss": fmt_loss(get_loss(test_losses, "total_loss")),
@@ -715,7 +762,8 @@ def write_loss_row(
     csv_file.flush()
 
 
-def save_final_model(accelerator, model, emotion_table, model_path, output_model_path, speaker_name):
+def save_final_model(accelerator, model, emotion_table, model_path, output_model_path,
+                     speaker_name, emotion_scale=1.0):
     if not accelerator.is_main_process:
         return
     source_model_path = model_path
@@ -791,8 +839,14 @@ def save_final_model(accelerator, model, emotion_table, model_path, output_model
     report_speaker_drift(accelerator)
     report_emotion_table(emotion_weight, accelerator, speaker_vector)
 
+    if emotion_scale != 1.0:
+        accelerator.print(
+            f"Baking emotion offsets at {emotion_scale}x. The speaker vector is not "
+            "scaled, so timbre is unchanged and only the emotion offset is pushed "
+            "further along its own direction."
+        )
     for index, emotion in enumerate(EMOTIONS):
-        combined = speaker_vector + emotion_weight[index]
+        combined = speaker_vector + emotion_scale * emotion_weight[index]
         weight[SPEAKER_SLOT_START + index] = combined.to(weight.device).to(weight.dtype)
         accelerator.print(
             f"codec_embedding[{SPEAKER_SLOT_START + index}] <- "
@@ -805,7 +859,12 @@ def save_final_model(accelerator, model, emotion_table, model_path, output_model
     # The raw table is not part of the model; keep it for inspection and for
     # rebuilding the rows without retraining.
     torch.save(
-        {"emotions": EMOTIONS, "emotion_weight": emotion_weight, "speaker_vector": speaker_vector},
+        {
+            "emotions": EMOTIONS,
+            "emotion_weight": emotion_weight,
+            "speaker_vector": speaker_vector,
+            "emotion_scale": emotion_scale,
+        },
         os.path.join(output_model_path, "emotion_table.pt"),
     )
 
@@ -911,6 +970,7 @@ def train():
                 "val_sub_talker_loss",
                 "val_total_loss",
                 "val_emotion_delta",
+                "val_emotion_shuffle_delta",
                 "test_main_loss",
                 "test_sub_talker_loss",
                 "test_total_loss",
@@ -958,7 +1018,10 @@ def train():
             if args.max_train_batches is not None and step >= args.max_train_batches:
                 break
             with accelerator.accumulate(model):
-                loss, batch_stats, speaker_embedding = compute_loss(model, batch, emotion_table)
+                loss, batch_stats, speaker_embedding = compute_loss(
+                    model, batch, emotion_table,
+                    emotion_dropout=args.emotion_dropout,
+                )
                 loss_is_finite = torch.isfinite(loss.detach()).all()
                 if not bool(loss_is_finite.item()):
                     epoch_has_nan_or_inf = True
@@ -1005,13 +1068,26 @@ def train():
             zero_emotion=True,
         )
         emotion_delta = val_losses_ablated["main_loss"] - val_losses["main_loss"]
+        # Every sample gets another emotion's vector. Zeroing asks whether the
+        # table contributes at all; this asks whether the six vectors are
+        # distinguishable, which is the thing emotion control actually needs.
+        # Six identical vectors would score a large zero-delta and a shuffle
+        # delta of zero, and only the second answer would be right.
+        val_losses_shuffled = evaluate(
+            model, val_dataloader, accelerator, emotion_table, args.max_eval_batches,
+            shift_emotion=1,
+        )
+        emotion_shuffle_delta = val_losses_shuffled["main_loss"] - val_losses["main_loss"]
         train_loss = train_losses["total_loss"]
         val_loss = val_losses["total_loss"]
         epoch_gradient_norm = (
             epoch_gradient_norm_sum / epoch_gradient_norm_count
             if epoch_gradient_norm_count > 0 else None
         )
-        if args.select_by == "emotion_delta":
+        if args.select_by == "emotion_shuffle":
+            score = emotion_shuffle_delta
+            improved = best_score is None or score > best_score
+        elif args.select_by == "emotion_delta":
             score, improved = emotion_delta, best_score is None or emotion_delta > best_score
         else:
             score, improved = val_loss, best_score is None or val_loss < best_score
@@ -1034,7 +1110,7 @@ def train():
             f"Val main/sub/total: {val_losses['main_loss']:.6f}/"
             f"{val_losses['sub_talker_loss']:.6f}/{val_losses['total_loss']:.6f} | "
             f"Grad norm: {epoch_gradient_norm if epoch_gradient_norm is not None else 'NA'} | "
-            f"Emotion delta: {emotion_delta:+.6f} | "
+            f"Emotion delta zero/shuffle: {emotion_delta:+.6f}/{emotion_shuffle_delta:+.6f} | "
             f"LoRA: {'on' if lora_active else 'frozen'} | "
             f"NaN/Inf: {epoch_has_nan_or_inf} | "
             f"Best by {args.select_by}: val {best_val_loss:.6f}, "
@@ -1054,6 +1130,7 @@ def train():
                 epoch_gradient_norm,
                 epoch_has_nan_or_inf,
                 emotion_delta=emotion_delta,
+                emotion_shuffle_delta=emotion_shuffle_delta,
             )
 
         if emotion_loaders and (epoch + 1) % args.emotion_eval_every == 0:
@@ -1130,7 +1207,8 @@ def train():
 
     accelerator.wait_for_everyone()
     save_final_model(
-        accelerator, model, emotion_table, MODEL_PATH, args.output_model_path, args.speaker_name
+        accelerator, model, emotion_table, MODEL_PATH, args.output_model_path,
+        args.speaker_name, emotion_scale=args.emotion_scale,
     )
     accelerator.wait_for_everyone()
 
