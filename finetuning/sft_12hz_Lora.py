@@ -139,6 +139,29 @@ def parse_args():
         ),
     )
     parser.add_argument("--seed", type=int, default=41)
+    parser.add_argument(
+        "--freeze_lora_epochs",
+        type=int,
+        default=0,
+        help=(
+            "Train the emotion table alone for this many epochs before the LoRA "
+            "adapters start updating. Both share one loss, so whatever the "
+            "adapters explain first is gradient the table never sees; holding "
+            "them back gives the table first claim on the error signal."
+        ),
+    )
+    parser.add_argument(
+        "--select_by",
+        choices=("val_loss", "emotion_delta"),
+        default="val_loss",
+        help=(
+            "Checkpoint selection criterion. val_loss cannot see whether emotion "
+            "conditioning works: when the transcript already implies the emotion, "
+            "a dead emotion table and a working one score nearly the same. "
+            "emotion_delta selects the epoch where zeroing the emotion vectors "
+            "hurts validation the most, which is the effect we actually want."
+        ),
+    )
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
@@ -226,6 +249,21 @@ def apply_lora(model, args, accelerator):
         f"({100.0 * trainable_parameters / total_parameters:.4f}%)"
     )
     return model
+
+
+def set_lora_requires_grad(parameters, trainable):
+    """Flip the adapters on or off. Returns True when the call changed something.
+
+    Freezing here leaves the graph intact: the emotion table still requires grad,
+    so backward walks through the frozen weights to reach it. The adapters simply
+    stop accumulating .grad, and AdamW skips them.
+    """
+    changed = False
+    for parameter in parameters:
+        if parameter.requires_grad != trainable:
+            parameter.requires_grad = trainable
+            changed = True
+    return changed
 
 
 def build_emotion_table(hidden_size, accelerator):
@@ -371,7 +409,7 @@ def build_dataloader(data, processor, config, batch_size, shuffle):
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=dataset.collate_fn)
 
 
-def compute_loss(model, batch, emotion_table):
+def compute_loss(model, batch, emotion_table, zero_emotion=False):
     input_ids = batch['input_ids']
     codec_ids = batch['codec_ids']
     ref_mels = batch['ref_mels']
@@ -388,6 +426,10 @@ def compute_loss(model, batch, emotion_table):
     track_speaker_drift(speaker_embedding, target_speaker_embedding)
     # NOT detached: this is the only path by which the emotion table learns.
     emotion_embedding = emotion_table(emotion_ids.to(model.device))
+    # Ablation for the emotion_delta metric: keep every other input identical and
+    # drop only the emotion offset, so the loss difference is attributable to it.
+    if zero_emotion:
+        emotion_embedding = torch.zeros_like(emotion_embedding)
 
     input_text_ids = input_ids[:, :, 0]
     input_codec_ids = input_ids[:, :, 1]
@@ -482,14 +524,16 @@ def finalize_loss(total_stats):
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, accelerator, emotion_table, max_batches=None):
+def evaluate(model, dataloader, accelerator, emotion_table, max_batches=None, zero_emotion=False):
     model.eval()
     emotion_table.eval()
     total_stats = _empty_loss_stats()
     for step, batch in enumerate(dataloader):
         if max_batches is not None and step >= max_batches:
             break
-        _loss, batch_stats, _speaker_embedding = compute_loss(model, batch, emotion_table)
+        _loss, batch_stats, _speaker_embedding = compute_loss(
+            model, batch, emotion_table, zero_emotion=zero_emotion
+        )
         add_loss_stats(total_stats, batch_stats, accelerator)
     model.train()
     emotion_table.train()
@@ -637,6 +681,7 @@ def write_loss_row(
     current_lr_value,
     gradient_norm=None,
     has_nan_or_inf=False,
+    emotion_delta=None,
 ):
     def get_loss(losses, key):
         if losses is None:
@@ -659,6 +704,7 @@ def write_loss_row(
         "val_main_loss": fmt_loss(get_loss(val_losses, "main_loss")),
         "val_sub_talker_loss": fmt_loss(get_loss(val_losses, "sub_talker_loss")),
         "val_total_loss": fmt_loss(get_loss(val_losses, "total_loss")),
+        "val_emotion_delta": fmt_loss(emotion_delta),
         "test_main_loss": fmt_loss(get_loss(test_losses, "main_loss")),
         "test_sub_talker_loss": fmt_loss(get_loss(test_losses, "sub_talker_loss")),
         "test_total_loss": fmt_loss(get_loss(test_losses, "total_loss")),
@@ -817,6 +863,13 @@ def train():
     model, emotion_table, optimizer, train_dataloader, val_dataloader, test_dataloader = accelerator.prepare(
         qwen3tts.model, emotion_table, optimizer, train_dataloader, val_dataloader, test_dataloader
     )
+    # Re-resolved from the prepared model rather than reusing the list built
+    # above: --freeze_lora_epochs toggles requires_grad on these objects, and
+    # they have to be the ones the forward pass actually uses. The emotion table
+    # is prepared separately, so it is not in here and never gets frozen.
+    lora_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
     emotion_loaders = (
         build_emotion_dataloaders(
             {"val": val_data, "test": test_data},
@@ -833,6 +886,8 @@ def train():
     emotion_table.train()
     global_step = 0
     best_val_loss = None
+    best_emotion_delta = None
+    best_score = None
     best_epoch = 0
     best_model_state = None
     best_emotion_state = None
@@ -855,6 +910,7 @@ def train():
                 "val_main_loss",
                 "val_sub_talker_loss",
                 "val_total_loss",
+                "val_emotion_delta",
                 "test_main_loss",
                 "test_sub_talker_loss",
                 "test_total_loss",
@@ -888,6 +944,12 @@ def train():
         emotion_csv_file.flush()
 
     for epoch in range(num_epochs):
+        lora_active = epoch >= args.freeze_lora_epochs
+        if set_lora_requires_grad(lora_parameters, lora_active):
+            accelerator.print(
+                f"Epoch {epoch + 1}: LoRA adapters "
+                f"{'unfrozen, both groups now train' if lora_active else 'frozen, emotion table trains alone'}"
+            )
         train_stats = _empty_loss_stats()
         epoch_gradient_norm_sum = 0.0
         epoch_gradient_norm_count = 0
@@ -934,14 +996,29 @@ def train():
 
         train_losses = finalize_loss(train_stats)
         val_losses = evaluate(model, val_dataloader, accelerator, emotion_table, args.max_eval_batches)
+        # Same rows, same weights, emotion offsets zeroed. How much worse the
+        # model gets is how much the emotion table is actually contributing.
+        # main_loss only: the sub-talker term sits on a plateau and would just
+        # add noise to the difference.
+        val_losses_ablated = evaluate(
+            model, val_dataloader, accelerator, emotion_table, args.max_eval_batches,
+            zero_emotion=True,
+        )
+        emotion_delta = val_losses_ablated["main_loss"] - val_losses["main_loss"]
         train_loss = train_losses["total_loss"]
         val_loss = val_losses["total_loss"]
         epoch_gradient_norm = (
             epoch_gradient_norm_sum / epoch_gradient_norm_count
             if epoch_gradient_norm_count > 0 else None
         )
-        if best_val_loss is None or val_loss < best_val_loss:
+        if args.select_by == "emotion_delta":
+            score, improved = emotion_delta, best_score is None or emotion_delta > best_score
+        else:
+            score, improved = val_loss, best_score is None or val_loss < best_score
+        if improved:
+            best_score = score
             best_val_loss = val_loss
+            best_emotion_delta = emotion_delta
             best_epoch = epoch + 1
             best_model_state = clone_model_state(model, accelerator)
             best_emotion_state = clone_model_state(emotion_table, accelerator)
@@ -957,8 +1034,11 @@ def train():
             f"Val main/sub/total: {val_losses['main_loss']:.6f}/"
             f"{val_losses['sub_talker_loss']:.6f}/{val_losses['total_loss']:.6f} | "
             f"Grad norm: {epoch_gradient_norm if epoch_gradient_norm is not None else 'NA'} | "
-            f"NaN/Inf: {epoch_has_nan_or_inf} | Best Val Loss: {best_val_loss:.6f} "
-            f"(epoch {best_epoch})"
+            f"Emotion delta: {emotion_delta:+.6f} | "
+            f"LoRA: {'on' if lora_active else 'frozen'} | "
+            f"NaN/Inf: {epoch_has_nan_or_inf} | "
+            f"Best by {args.select_by}: val {best_val_loss:.6f}, "
+            f"delta {best_emotion_delta:+.6f} (epoch {best_epoch})"
         )
         if accelerator.is_main_process:
             write_loss_row(
@@ -973,6 +1053,7 @@ def train():
                 lr,
                 epoch_gradient_norm,
                 epoch_has_nan_or_inf,
+                emotion_delta=emotion_delta,
             )
 
         if emotion_loaders and (epoch + 1) % args.emotion_eval_every == 0:
@@ -996,8 +1077,9 @@ def train():
     if best_model_state is None:
         raise ValueError("No validation result was recorded; cannot restore best model for final test")
     accelerator.print(
-        f"Restoring best model from epoch {best_epoch} with Validation Loss {best_val_loss:.6f} "
-        "before final test."
+        f"Restoring best model from epoch {best_epoch} (selected by {args.select_by}) "
+        f"with Validation Loss {best_val_loss:.6f} and emotion delta "
+        f"{best_emotion_delta:+.6f} before final test."
     )
     load_model_state(model, accelerator, best_model_state)
     load_model_state(emotion_table, accelerator, best_emotion_state)

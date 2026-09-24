@@ -178,6 +178,41 @@ wavs, sr = tts.generate_custom_voice(
 ```
 
 
+### Giving the emotion table a bigger share of the gradient
+
+The adapters and the emotion table are two parameter groups under one loss, so
+they compete for the same error signal. The adapters see the transcript and
+have far more capacity, so on a corpus whose text already implies the emotion
+they explain most of it first, and the table only ever learns the residual.
+Two flags address that without touching the data.
+
+**`--freeze_lora_epochs N`** holds the adapters at `requires_grad=False` for
+the first N epochs, so the emotion table trains alone and has first claim on
+the error signal. Backward still reaches the table through the frozen weights;
+the adapters simply stop accumulating gradients and AdamW skips them. This also
+tests the competition explanation directly: if the emotion effect grows, the
+table was being crowded out; if nothing moves, it has hit its capacity and the
+conditioning channel itself needs to change.
+
+**`--select_by emotion_delta`** changes which checkpoint is kept. Validation
+loss cannot see whether emotion conditioning works -- when the transcript
+implies the emotion, a dead emotion table and a working one score nearly the
+same, so selecting on it is close to selecting at random with respect to the
+thing being trained. Every epoch now also evaluates the validation set with the
+emotion offsets zeroed and logs the gap as `val_emotion_delta` in
+`loss_history.csv`. A larger gap means the emotion vectors are carrying more of
+the prediction. `--select_by emotion_delta` keeps the epoch that maximises it;
+the default `val_loss` preserves the old behaviour. The column is written
+either way, so a plain run still shows where the emotion effect peaks -- and
+that epoch is usually not the one with the lowest validation loss.
+
+Only `main_loss` enters the delta. The sub-talker term sits on a plateau
+throughout training and would add noise to the difference.
+
+```bash
+python3 Qwen3-TTS/finetuning/sft_12hz_Lora.py   --dataset_dir <data> --speaker_name F2   --freeze_lora_epochs 5 --select_by emotion_delta
+```
+
 ### Diagnosing a run where the emotion vectors do not seem to do anything
 
 `loss_history.csv` cannot tell you whether emotion conditioning worked. On a
