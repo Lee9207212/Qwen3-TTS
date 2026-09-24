@@ -313,8 +313,14 @@ def build_emotion_table(hidden_size, accelerator):
     return table
 
 
-def report_emotion_counts(splits, accelerator):
-    """Print the per-split emotion histogram and fail fast on empty rows."""
+def report_emotion_counts(splits, accelerator, require_all=True):
+    """Print the per-split emotion histogram and fail fast on empty rows.
+
+    require_all=False is for deliberately single-emotion runs, where the point
+    is to isolate something other than emotion conditioning -- a data-size
+    ablation, say. With --emotion_lr 0 no row is updated anyway, so untrained
+    rows are the intended state rather than a bug.
+    """
     accelerator.print("Emotion distribution:")
     header = f"  {'split':<8}" + "".join(f"{name[:8]:>10}" for name in EMOTIONS) + f"{'total':>8}"
     accelerator.print(header)
@@ -327,9 +333,15 @@ def report_emotion_counts(splits, accelerator):
         row["emotion"] == name for row in splits["train"]
     )]
     if missing:
-        raise ValueError(
-            f"No training samples for {missing}; those emotion rows would never "
-            "receive a gradient and would stay at their zero initialisation"
+        if require_all:
+            raise ValueError(
+                f"No training samples for {missing}; those emotion rows would never "
+                "receive a gradient and would stay at their zero initialisation. "
+                "Pass --emotion_lr 0 if this is a deliberate single-emotion run."
+            )
+        accelerator.print(
+            f"  No training samples for {missing}. Those rows stay at their zero "
+            "initialisation, which is expected with --emotion_lr 0."
         )
     thin = [name for name in EMOTIONS if not any(
         row["emotion"] == name for row in splits["val"]
@@ -895,7 +907,8 @@ def train():
     val_data = load_jsonl(args.val_jsonl, "validation")
     test_data = load_jsonl(args.test_jsonl, "test")
     report_emotion_counts(
-        {"train": train_data, "val": val_data, "test": test_data}, accelerator
+        {"train": train_data, "val": val_data, "test": test_data}, accelerator,
+        require_all=args.emotion_lr > 0,
     )
     train_dataloader = build_dataloader(train_data, qwen3tts.processor, config, args.batch_size, shuffle=True)
     val_dataloader = build_dataloader(val_data, qwen3tts.processor, config, args.batch_size, shuffle=False)
