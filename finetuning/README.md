@@ -237,6 +237,29 @@ seen it vary and there is no learned behaviour to extrapolate -- larger values
 then distort the voice instead of intensifying the emotion. Past some point
 that happens regardless, so listen rather than trusting the effect sizes.
 
+### The loss curve
+
+Every run writes `loss_curve.png` next to its `loss_history.csv`. Training loss
+falling while validation loss rises is overfitting, and the figure settles that
+in a glance; a run that was stopped early and a run that diverged look nothing
+alike on it. A failed plot never fails the run -- the CSV holds everything and
+the figure can be rebuilt.
+
+```bash
+python3 finetuning/plot_loss_history.py output/loss_history.csv
+python3 finetuning/plot_loss_history.py output/loss_history.csv --mark_epoch 5
+```
+
+The top panel is train vs validation main loss, with the best validation epoch
+marked and the final gap in the title. `--mark_epoch` draws a vertical line,
+which training passes automatically when `--freeze_lora_epochs` is set so the
+handover is visible. A second panel appears when the emotion delta columns are
+populated, which is where the adapters taking the emotion table's job over shows
+up as a decay after that line.
+
+Needs matplotlib. The two series differ in both hue and dash pattern, so the
+figure survives greyscale printing and colour-vision deficiency.
+
 ### Diagnosing a run where the emotion vectors do not seem to do anything
 
 `loss_history.csv` cannot tell you whether emotion conditioning worked. On a

@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from dataset import EMOTION_TO_ID, EMOTIONS, TTSDataset
+from plot_loss_history import plot as plot_loss_curve
 from huggingface_hub import snapshot_download
 try:
     from peft import LoraConfig, PeftModel, get_peft_model
@@ -1217,6 +1218,26 @@ def train():
                 test_emotion_losses,
             )
             emotion_csv_file.close()
+
+        # Every run leaves a figure next to its CSV. The train/validation gap is
+        # the whole argument about overfitting, and it is far quicker to settle
+        # by looking than by reading numbers out of a spreadsheet.
+        try:
+            figure_path = plot_loss_curve(
+                csv_path,
+                os.path.join(args.output_model_path, "loss_curve.png"),
+                os.path.basename(os.path.normpath(args.output_model_path)),
+                mark_epoch=args.freeze_lora_epochs,
+            )
+            accelerator.print(f"Wrote {figure_path}")
+        except Exception as error:
+            # Never fail a finished run over a figure; the CSV holds everything.
+            accelerator.print(
+                f"Could not plot the loss curve ({error}). Re-plot later with:"
+            )
+            accelerator.print(
+                f"  python3 finetuning/plot_loss_history.py {csv_path}"
+            )
 
     accelerator.wait_for_everyone()
     save_final_model(
