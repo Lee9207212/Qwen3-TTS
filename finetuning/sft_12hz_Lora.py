@@ -152,6 +152,18 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--center_emotion_table",
+        action="store_true",
+        help=(
+            "Subtract the mean row on every lookup so the six emotion vectors "
+            "sum to zero. Without it the table can absorb whatever is common to "
+            "the whole corpus, which inflates --select_by emotion_delta while "
+            "providing no emotion control; with it, that offset has to live in "
+            "the adapters and the delta measures only what differs between "
+            "emotions. Off by default so runs stay comparable with earlier ones."
+        ),
+    )
+    parser.add_argument(
         "--emotion_dropout",
         type=float,
         default=0.0,
@@ -292,24 +304,59 @@ def set_lora_requires_grad(parameters, trainable):
     return changed
 
 
-def build_emotion_table(hidden_size, accelerator):
-    """A small zero-initialised lookup table, one row per emotion.
+class EmotionTable(torch.nn.Module):
+    """One zero-initialised row per emotion, optionally constrained to sum to zero.
 
-    It is deliberately kept outside the PEFT-wrapped model: anything attached
-    after get_peft_model() is either frozen by PEFT or dropped by
-    merge_and_unload(). Keeping it separate means we own its gradients, its
-    optimizer group and its checkpointing.
+    Kept outside the PEFT wrapper on purpose: anything attached after
+    get_peft_model() is either frozen by PEFT or dropped by merge_and_unload().
+    Owning it separately means we own its gradients, its optimizer group and its
+    checkpointing. Zero initialisation makes the first step numerically
+    identical to speaker-only fine-tuning, which is a free sanity check.
 
-    Zero initialisation makes the first training step numerically identical to
-    speaker-only fine-tuning, which is a free sanity check.
+    With center=True the mean row is subtracted on every lookup, so the six
+    vectors the model actually sees always sum to zero. That matters because
+    nothing otherwise stops all six from drifting the same way: early in
+    training, and especially with the adapters frozen, the largest thing left to
+    fit is the shift from the base model's default voice to this corpus, which
+    is identical across emotions. The table will absorb it if allowed to,
+    leaving six near-parallel vectors that carry little emotion. Centering
+    denies it a place to live, so it goes back to the adapters and these rows
+    can only hold what differs between emotions.
+
+    It also repairs the emotion_delta metric. Zeroing the vectors measures the
+    table's whole contribution, shared part included, so a shared component
+    inflates it -- six identical vectors would score well while providing no
+    emotion control at all. Once the rows sum to zero their mean IS the zero
+    vector, so zeroing and substituting the mean are the same operation and the
+    number means what it claims to.
+
+    Centering couples the rows: each one's gradient now carries a term from all
+    six. That is what enforces the constraint, and it is why the constraint is
+    applied at lookup rather than by editing the weights between steps.
     """
-    table = torch.nn.Embedding(len(EMOTIONS), hidden_size)
-    torch.nn.init.zeros_(table.weight)
-    # Kept in fp32: bf16 cannot accumulate the small updates this table needs.
-    table = table.float()
+
+    def __init__(self, num_emotions, hidden_size, center):
+        super().__init__()
+        # fp32: bf16 cannot accumulate updates this small.
+        self.weight = torch.nn.Parameter(torch.zeros(num_emotions, hidden_size, dtype=torch.float32))
+        self.center = center
+
+    def effective_weight(self):
+        """The rows the model sees. Export must bake these, not self.weight."""
+        if self.center:
+            return self.weight - self.weight.mean(dim=0, keepdim=True)
+        return self.weight
+
+    def forward(self, ids):
+        return torch.nn.functional.embedding(ids, self.effective_weight())
+
+
+def build_emotion_table(hidden_size, accelerator, center=False):
+    table = EmotionTable(len(EMOTIONS), hidden_size, center)
     accelerator.print(
         f"Emotion table: {len(EMOTIONS)} x {hidden_size} "
-        f"({table.weight.numel():,} parameters), rows = {EMOTIONS}"
+        f"({table.weight.numel():,} parameters), rows = {EMOTIONS}, "
+        f"zero-mean constraint = {center}"
     )
     return table
 
@@ -857,7 +904,12 @@ def save_final_model(accelerator, model, emotion_table, model_path, output_model
         )
 
     speaker_vector = target_speaker_embedding[0].detach().to("cpu").float()
-    emotion_weight = accelerator.unwrap_model(emotion_table).weight.detach().to("cpu").float()
+    unwrapped_table = accelerator.unwrap_model(emotion_table)
+    # effective_weight(), never .weight: with the zero-mean constraint those
+    # differ, and baking the raw rows would ship a model that behaves unlike the
+    # one that was validated.
+    emotion_weight = unwrapped_table.effective_weight().detach().to("cpu").float()
+    raw_emotion_weight = unwrapped_table.weight.detach().to("cpu").float()
 
     report_speaker_drift(accelerator)
     report_emotion_table(emotion_weight, accelerator, speaker_vector)
@@ -885,6 +937,8 @@ def save_final_model(accelerator, model, emotion_table, model_path, output_model
         {
             "emotions": EMOTIONS,
             "emotion_weight": emotion_weight,
+            "emotion_weight_raw": raw_emotion_weight,
+            "centered": bool(unwrapped_table.center),
             "speaker_vector": speaker_vector,
             "emotion_scale": emotion_scale,
         },
@@ -934,7 +988,9 @@ def train():
     val_dataloader = build_dataloader(val_data, qwen3tts.processor, config, args.batch_size, shuffle=False)
     test_dataloader = build_dataloader(test_data, qwen3tts.processor, config, args.batch_size, shuffle=False)
 
-    emotion_table = build_emotion_table(config.talker_config.hidden_size, accelerator)
+    emotion_table = build_emotion_table(
+        config.talker_config.hidden_size, accelerator, center=args.center_emotion_table
+    )
 
     trainable_parameters = [
         parameter

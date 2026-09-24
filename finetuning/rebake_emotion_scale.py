@@ -62,6 +62,10 @@ def main():
     emotion_weight = table["emotion_weight"].float()
     speaker_vector = table["speaker_vector"].float()
     trained_scale = table.get("emotion_scale", 1.0)
+    # "emotion_weight" is always the rows the model was validated with -- the
+    # centered ones when --center_emotion_table was used -- so nothing here has
+    # to know which parameterisation produced them.
+    centered = table.get("centered", False)
 
     with open(os.path.join(args.model_dir, "config.json"), encoding="utf-8") as handle:
         config = json.load(handle)
@@ -84,7 +88,10 @@ def main():
             "This script only handles the layout sft_12hz_Lora.py writes."
         )
 
-    print(f"Re-baking {args.model_dir} at {args.scale}x (was baked at {trained_scale:g}x)")
+    print(
+        f"Re-baking {args.model_dir} at {args.scale}x (was baked at {trained_scale:g}x, "
+        f"zero-mean constraint = {centered})"
+    )
     state_dict = load_file(weights_path)
     key = "talker.model.codec_embedding.weight"
     weight = state_dict[key]

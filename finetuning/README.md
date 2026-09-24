@@ -213,6 +213,37 @@ throughout training and would add noise to the difference.
 python3 Qwen3-TTS/finetuning/sft_12hz_Lora.py   --dataset_dir <data> --speaker_name F2   --freeze_lora_epochs 5 --select_by emotion_delta
 ```
 
+### Keeping the emotion table from absorbing what is not emotion
+
+`--center_emotion_table` subtracts the mean row on every lookup, so the six
+vectors the model sees always sum to zero.
+
+Nothing otherwise stops all six from drifting the same way. Early in training --
+and especially with `--freeze_lora_epochs`, where the table is the only thing
+learning -- the largest unexplained thing is the shift from the base model's
+default voice to this corpus, and that shift is identical across emotions. The
+table absorbs it, and the result is six near-parallel vectors: in one frozen run
+the mean pairwise cosine reached 0.67, against 0.25 for ordinary joint training.
+Six vectors pointing the same way give no emotion control at all, because every
+emotion then produces the same output.
+
+This also repairs `val_emotion_delta`. Zeroing the vectors removes the table's
+whole contribution, shared part included, so a shared component inflates the
+number -- six identical vectors would score a large delta while controlling
+nothing. Once the rows sum to zero their mean is the zero vector, so zeroing and
+substituting the mean become the same operation and the delta measures only what
+differs between emotions. `val_emotion_shuffle_delta` answers the same question
+from the other side and does not depend on this flag.
+
+The constraint is applied at lookup rather than by editing weights between
+steps, which keeps it exactly satisfied and lets the gradient carry it: each
+row's gradient picks up a term from all six. Export bakes `effective_weight()`,
+so a checkpoint always behaves like the model that was validated, and
+`emotion_table.pt` keeps both the baked rows and the raw parameter.
+
+Off by default, so existing runs stay comparable. Turn it on for new
+comparisons, and do not read a centered delta against an uncentered one.
+
 ### Changing the emotion strength without retraining
 
 `--emotion_scale` multiplies the emotion offsets as they are baked into the
